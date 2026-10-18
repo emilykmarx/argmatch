@@ -1,11 +1,12 @@
 // argmatch is a -toolexec wrapper that makes a Go program report, each time
 // a given function is called, which strings and byte slices in the function's receiver and
-// arguments contain a given needle, and which named types and interfaces
-// contain each match.
+// arguments contain any of the given match strings, and which named types
+// and interfaces contain each match.
 //
 //	go build -o argmatch .   # in this directory
 //	go build -toolexec "/path/to/argmatch -func main.ID.F -match needle -depth 5" .
 //	ARGMATCH_FUNC=main.ID.F ARGMATCH_MATCH=needle GOFLAGS=-toolexec=/path/to/argmatch go build .
+//	go build -toolexec "/path/to/argmatch -func main.ID.F -matchfile /abs/path/matches.txt" .
 //
 // The function may be in any package of the build, including the standard
 // library, and is named as delve names it: pkg/path.Func, pkg/path.T.M or
@@ -46,12 +47,45 @@ const (
 // Each flag defaults to an environment variable, for use with
 // GOFLAGS=-toolexec=/path/to/argmatch (GOFLAGS values can't contain spaces).
 var (
-	funcName = flag.String("func", os.Getenv("ARGMATCH_FUNC"), "function to check, as named by delve (required; env ARGMATCH_FUNC)")
-	needle   = flag.String("match", os.Getenv("ARGMATCH_MATCH"), "string to look for (required; env ARGMATCH_MATCH)")
-	depth    = flag.Int("depth", envInt("ARGMATCH_DEPTH", 5), "how many levels of nested structs, arrays, maps and pointers-to-pointers to load (delve's MaxVariableRecurse; env ARGMATCH_DEPTH)")
-	outPath  = flag.String("out", os.Getenv("ARGMATCH_OUT"), "file the program appends its matches to, resolved against the program's working directory (default: stderr; env ARGMATCH_OUT)")
-	rtDir    = flag.String("rtdir", os.Getenv("ARGMATCH_RTDIR"), "directory of the argmatch module (default: the directory containing this executable; env ARGMATCH_RTDIR)")
+	funcName  = flag.String("func", os.Getenv("ARGMATCH_FUNC"), "function to check, as named by delve (required; env ARGMATCH_FUNC)")
+	needle    = flag.String("match", os.Getenv("ARGMATCH_MATCH"), "string to look for (env ARGMATCH_MATCH)")
+	matchFile = flag.String("matchfile", os.Getenv("ARGMATCH_MATCHFILE"), "absolute path of a file of strings to look for, one per line, in addition to -match; blank lines are ignored (env ARGMATCH_MATCHFILE)")
+	depth     = flag.Int("depth", envInt("ARGMATCH_DEPTH", 5), "how many levels of nested structs, arrays, maps and pointers-to-pointers to load (delve's MaxVariableRecurse; env ARGMATCH_DEPTH)")
+	outPath   = flag.String("out", os.Getenv("ARGMATCH_OUT"), "file the program appends its matches to, resolved against the program's working directory (default: stderr; env ARGMATCH_OUT)")
+	rtDir     = flag.String("rtdir", os.Getenv("ARGMATCH_RTDIR"), "directory of the argmatch module (default: the directory containing this executable; env ARGMATCH_RTDIR)")
 )
+
+// needles holds -match and the lines of -matchfile.
+var needles []string
+
+// loadNeedles returns -match and the non-blank lines of -matchfile, without
+// duplicates. Each line is used as is, apart from a trailing \r.
+func loadNeedles() []string {
+	var ns []string
+	if *needle != "" {
+		ns = append(ns, *needle)
+	}
+	if *matchFile != "" {
+		// The go command runs tools in each package's directory, so a
+		// relative path would mean something different for each package.
+		if !filepath.IsAbs(*matchFile) {
+			fmt.Fprintf(os.Stderr, "argmatch: -matchfile %s must be an absolute path\n", *matchFile)
+			os.Exit(2)
+		}
+		data, err := os.ReadFile(*matchFile)
+		check(err)
+		for _, line := range strings.Split(string(data), "\n") {
+			if line = strings.TrimSuffix(line, "\r"); line != "" && !slices.Contains(ns, line) {
+				ns = append(ns, line)
+			}
+		}
+	}
+	if len(ns) == 0 {
+		fmt.Fprintln(os.Stderr, "argmatch: no strings to match")
+		os.Exit(2)
+	}
+	return ns
+}
 
 func envInt(name string, def int) int {
 	if n, err := strconv.Atoi(os.Getenv(name)); err == nil {
@@ -62,14 +96,15 @@ func envInt(name string, def int) int {
 
 func main() {
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: go build -toolexec \"%s -func pkg.Func -match string [-depth n]\" ...\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "usage: go build -toolexec \"%s -func pkg.Func {-match string | -matchfile /path} [-depth n]\" ...\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
-	if *funcName == "" || *needle == "" || flag.NArg() == 0 {
+	if *funcName == "" || *needle == "" && *matchFile == "" || flag.NArg() == 0 {
 		flag.Usage()
 		os.Exit(2)
 	}
+	needles = loadNeedles()
 	if *rtDir == "" {
 		exe, err := os.Executable()
 		check(err)
@@ -120,7 +155,7 @@ func printToolID(tool string) {
 		rtFiles, err := filepath.Glob(filepath.Join(*rtDir, "rt", "*.go"))
 		check(err)
 		h := sha256.New()
-		fmt.Fprintf(h, "%q %q %d %q ", *funcName, *needle, *depth, *outPath)
+		fmt.Fprintf(h, "%q %q %d %q ", *funcName, needles, *depth, *outPath)
 		for _, f := range append([]string{self, filepath.Join(*rtDir, "go.mod"), filepath.Join(*rtDir, "go.sum")}, rtFiles...) {
 			b, err := os.ReadFile(f)
 			check(err)
@@ -261,14 +296,18 @@ func instrument(fset *token.FileSet, f *ast.File, fd *ast.FuncDecl, size int) []
 	for i, n := range names {
 		quoted[i] = strconv.Quote(n)
 	}
-	call := fmt.Sprintf("%s(%q, %d, %q, %q, []string{%s}, []interface{}{%s});",
-		checkFn, *needle, *depth, *outPath, *funcName, strings.Join(quoted, ", "), strings.Join(addrs, ", "))
+	quotedNeedles := make([]string, len(needles))
+	for i, n := range needles {
+		quotedNeedles[i] = strconv.Quote(n)
+	}
+	call := fmt.Sprintf("%s([]string{%s}, %d, %q, %q, []string{%s}, []interface{}{%s});",
+		checkFn, strings.Join(quotedNeedles, ", "), *depth, *outPath, *funcName, strings.Join(quoted, ", "), strings.Join(addrs, ", "))
 	return append(edits,
 		edit{off(fd.Body.Lbrace) + 1, call},
 		// The target package can't import rt (it may be one of rt's own
 		// dependencies), so refer to rt.Check by its linker name instead.
 		edit{off(f.Name.End()), `; import _ "unsafe"`},
-		edit{size, fmt.Sprintf("\n//go:linkname %s %s.Check\nfunc %s(string, int, string, string, []string, []interface{})\n", checkFn, rtPkg, checkFn)},
+		edit{size, fmt.Sprintf("\n//go:linkname %s %s.Check\nfunc %s([]string, int, string, string, []string, []interface{})\n", checkFn, rtPkg, checkFn)},
 	)
 }
 
@@ -321,7 +360,7 @@ func rtExports(tool string) []string {
 		return `"` + s + `"`
 	}
 	toolexec := strings.Join([]string{quote(self), "-func", quote(*funcName), "-match", quote(*needle),
-		"-depth", strconv.Itoa(*depth), "-out", quote(*outPath), "-rtdir", quote(*rtDir)}, " ")
+		"-matchfile", quote(*matchFile), "-depth", strconv.Itoa(*depth), "-out", quote(*outPath), "-rtdir", quote(*rtDir)}, " ")
 	tmp, err := os.MkdirTemp("", "argmatch-mod")
 	check(err)
 	defer os.RemoveAll(tmp)

@@ -34,8 +34,8 @@ var (
 	owner int64 // goroutine ID holding mu, to detect re-entry
 )
 
-// Check reports every string in args that contains needle, along with the
-// named types and interfaces on the path down to it. names[i] is the
+// Check reports every string in args that contains one of needles, along
+// with the named types and interfaces on the path down to it. names[i] is the
 // source name of the parameter whose address is boxed in args[i]. Output
 // is appended to the file outPath, or written to stderr if outPath is "".
 //
@@ -43,7 +43,7 @@ var (
 // package (which can't import rt) refer to this function.
 //
 //go:linkname Check
-func Check(needle string, depth int, outPath string, fn string, names []string, args []any) {
+func Check(needles []string, depth int, outPath string, fn string, names []string, args []any) {
 	// The target function may be called by delve itself (e.g. if it's in
 	// the standard library), so ignore calls made while checking.
 	gid := goid()
@@ -107,15 +107,16 @@ func Check(needle string, depth int, outPath string, fn string, names []string, 
 			continue
 		}
 		arg := &box.Children[0].Children[0]
-		walk(arg, names[i], nil, func(path []string, expr, val string) {
-			fmt.Fprintf(out, "argmatch: %q in %s: %s (%s)\n", val, fn, strings.Join(path, " -> "), expr)
-		}, needle)
+		walk(arg, names[i], nil, func(path []string, expr, needle, val string) {
+			fmt.Fprintf(out, "argmatch: value %q contains %q in %s: %s (%s)\n", val, needle, fn, strings.Join(path, " -> "), expr)
+		}, needles)
 	}
 }
 
-// walk calls report for each string or []byte containing needle in v's tree, if any
-// named type or interface lies on the path to it. path holds those types.
-func walk(v *proc.Variable, expr string, path []string, report func(path []string, expr, val string), needle string) {
+// walk calls report for each string or []byte in v's tree and each of
+// needles it contains, if any named type or interface lies on the path to
+// it. path holds those types.
+func walk(v *proc.Variable, expr string, path []string, report func(path []string, expr, needle, val string), needles []string) {
 	if v.Unreadable != nil || v.DwarfType == nil {
 		return
 	}
@@ -126,20 +127,24 @@ func walk(v *proc.Variable, expr string, path []string, report func(path []strin
 		// continue below the dynamic value so it isn't reported twice.
 		data := &v.Children[0]
 		path = append(path, fmt.Sprintf("%s (concrete %s)", typ, data.DwarfType.String()))
-		walkValue(data, expr, path, report, needle)
+		walkValue(data, expr, path, report, needles)
 		return
 	case isNamed(typ):
 		path = append(path, typ)
 	}
-	walkValue(v, expr, path, report, needle)
+	walkValue(v, expr, path, report, needles)
 }
 
 // walkValue checks v itself, whose type is already accounted for in path,
 // then walks its children.
-func walkValue(v *proc.Variable, expr string, path []string, report func(path []string, expr, val string), needle string) {
+func walkValue(v *proc.Variable, expr string, path []string, report func(path []string, expr, needle, val string), needles []string) {
 	if len(path) > 0 {
-		if s, ok := stringValue(v); ok && strings.Contains(s, needle) {
-			report(path, expr, s)
+		if s, ok := stringValue(v); ok {
+			for _, needle := range needles {
+				if strings.Contains(s, needle) {
+					report(path, expr, needle, s)
+				}
+			}
 		}
 	}
 	for i := range v.Children {
@@ -159,7 +164,7 @@ func walkValue(v *proc.Variable, expr string, path []string, report func(path []
 		default:
 			cexpr = fmt.Sprintf("%s[%d]", expr, i)
 		}
-		walk(c, cexpr, path, report, needle)
+		walk(c, cexpr, path, report, needles)
 	}
 }
 

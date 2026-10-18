@@ -21,21 +21,28 @@ The settings can also come from the environment, which is how to use it with a b
 ARGMATCH_FUNC=main.ID.F ARGMATCH_MATCH=needle ARGMATCH_DEPTH=5 ARGMATCH_OUT=/tmp/argmatch.txt GOFLAGS=-toolexec=$A go build .
 ```
 
+To check against several strings, put them in a file, one per line, and pass it with `-matchfile` (env `ARGMATCH_MATCHFILE`). Every value is checked against every string, and each output line names the string that matched. `-matchfile` can be combined with `-match`. The file's path must be absolute, because the go command runs the wrapper in each package's directory. Lines are used exactly as written, including leading and trailing spaces; blank lines are ignored. The strings are read at build time, so rebuild after editing the file.
+
+```sh
+printf 'needle\needl\n' > /tmp/matches.txt
+(cd testdata/example && go build -toolexec "$A -func main.ID.F -matchfile /tmp/matches.txt" -o /tmp/example .) && /tmp/example
+```
+
 The wrapper path must be absolute, which is why it's set from `$PWD`. Matches are printed while the program runs, not during the build. By default they go to stderr. With `-out file` (env `ARGMATCH_OUT`) the program appends them to that file instead, so they can't be interleaved with the program's own stderr output. A relative path is resolved against the program's working directory when it runs, and if the file can't be opened, output falls back to stderr. `-depth` defaults to 5, so you can leave it off.
 
 Output for `F` in `testdata/example/main.go`:
 
 ```
-argmatch: "needle" in main.ID.F: main.ID (id_recvr)
-argmatch: "needle" in main.ID.F: main.ID2 (id_arg)
-argmatch: "needle" in main.ID.F: main.Hier (h<key 0>)
-argmatch: "needle" in main.ID.F: main.Named -> main.ID3 (in.Name)
-argmatch: "needle" in main.ID.F: main.Outer -> main.Inner -> main.ID4 (o.P.Name)
-argmatch: "needle" in main.ID.F: main.Iface (concrete main.ID5) (i)
+argmatch: value "needle" contains "needle" in main.ID.F: main.ID (id_recvr)
+argmatch: value "needle" contains "needle" in main.ID.F: main.ID2 (id_arg)
+argmatch: value "needle" contains "needle" in main.ID.F: main.Hier (h<key 0>)
+argmatch: value "needle" contains "needle" in main.ID.F: main.Named -> main.ID3 (in.Name)
+argmatch: value "needle" contains "needle" in main.ID.F: main.Outer -> main.Inner -> main.ID4 (o.P.Name)
+argmatch: value "needle" contains "needle" in main.ID.F: main.Iface (concrete main.ID5) (i)
 done
 ```
 
-`arr []string` correctly gives no output. Each line shows the matched string, the function, the named types from the argument down to the match, and the path to the value in brackets.
+`arr []string` correctly gives no output. Each line shows the match string, the whole value that contained it, the function, the named types from the argument down to the match, and the path to the value in brackets.
 
 ## How it works
 
@@ -46,7 +53,7 @@ The program is never stopped or attached to. All instrumentation happens at comp
 
 ## Tested
 
-`go test .` builds the example under argmatch and checks the matches for `F` against the output above. It takes a few seconds (longer with a cold build cache) and is skipped by `go test -short`.
+`go test .` builds the example under argmatch and checks the matches for `F`: once with `-match needle` against the output above, and once with a match file. It takes a few seconds (longer with a cold build cache) and is skipped by `go test -short`.
 
 Also tested by hand:
 
@@ -60,7 +67,7 @@ Also tested by hand:
 - **Matching the program's build:** the helper and delve are built against the program's versions of any modules both use, and with the outer `go build`'s `-tags`, `-race`, `-msan`, `-asan`, `-trimpath`, `-buildmode`, `-pgo` and `-installsuffix` flags. That keeps packages shared with the program identical, which the linker requires.
 - **What `-depth` counts:** it's delve's `MaxVariableRecurse`. Pointers don't count as a level, so `-depth 2` reaches `l.X.X.N` in `L1{L2{L3{N}}}` and `-depth 1` doesn't.
 - **Function names** use delve's naming: `pkg/path.Func`, `pkg.T.M` or `pkg.(*T).M`. Functions written in assembly can't be instrumented.
-- **What is matched:** string values and `[]byte`/byte array contents. Matches are partial: a value matches if it contains the match string anywhere, so `-match needle` reports `"xneedlex"`. The output shows the whole value that matched. Strings are loaded up to 64 KiB and arrays up to 4096 elements.
+- **What is matched:** string values and `[]byte`/byte array contents. A value matches if it contains the *full* match string anywhere, so `-match needle` reports `"xneedlex"`. The output shows both the match string and the whole value that contained it. A value that contains several match strings gives one line per string. Strings are loaded up to 64 KiB and arrays up to 4096 elements.
 - **First build is slow:** it recompiles the standard library unoptimized, about 6 s here. The cache is keyed on the settings, the wrapper binary and the helper's sources, so later builds are fast.
 - **Limitations:**
   - If the program's version of a shared module is too old for delve to compile against, the build fails.
@@ -86,3 +93,13 @@ docker run --rm -v /tmp/argmatch-out:/argmatch-out prometheus-argmatch:v3.2.1
 ```
 
 The base image runs Prometheus as `nobody`, so the host directory must be writable by that user (e.g. `chmod 777 /tmp/argmatch-out`).
+
+To use a match file, put it in the Prometheus source directory, which is copied to `/src` in the build stage, and pass its path in the container. `ARGMATCH_MATCH` defaults to the config path, so set it to empty to use only the file:
+
+```sh
+cp matches.txt ~/projects/config_tracing/prometheus/argmatch-matches.txt
+docker build -f prometheus/prombench-argmatch.Dockerfile --build-arg VERSION=v3.2.1 \
+    --build-arg ARGMATCH_MATCH= \
+    --build-arg ARGMATCH_MATCHFILE=/src/argmatch-matches.txt \
+    -t prometheus-argmatch:v3.2.1 .
+```

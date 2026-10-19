@@ -1,0 +1,3 @@
+argmatch: value "/tmp/tmp.SSAxUORCFN/prometheus.yml" contains "prometheus.yml" in github.com/prometheus/prometheus/web.(*Handler).testReady: github.com/prometheus/prometheus/web.Handler -> github.com/prometheus/prometheus/web/api/v1.API (h.apiV1.flagsMap[<key N>])
+argmatch: value "/tmp/tmp.SSAxUORCFN/prometheus.yml" contains "prometheus.yml" in github.com/prometheus/prometheus/web.(*Handler).testReady: github.com/prometheus/prometheus/web.Handler -> github.com/prometheus/prometheus/web.Options (h.options.Flags[<key N>])
+argmatch: value "/tmp/tmp.SSAxUORCFN/prometheus.yml" contains "prometheus.yml" in github.com/prometheus/prometheus/web.(*Handler).testReady: github.com/prometheus/prometheus/web.Handler (h.flagsMap[<key N>])

@@ -1,37 +1,30 @@
 // Package rt is linked into the program being built by argmatch. The
-// toolexec wrapper injects a call to Check at the top of the target
-// function; Check then uses delve, in-process, to load the function's
-// receiver and arguments from the program's own memory and DWARF info.
+// toolexec wrapper injects a call to Check at the top of each target
+// function; Check walks the function's receiver and arguments with reflect.
 package rt
 
 import (
 	"bytes"
 	"fmt"
-	"go/constant"
 	"io"
 	"os"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"unsafe"
-
-	"github.com/go-delve/delve/pkg/dwarf/godwarf"
-	"github.com/go-delve/delve/pkg/proc"
-	"github.com/go-delve/delve/pkg/proc/linutil"
 )
 
-var (
-	initOnce sync.Once
-	initErr  error
-	bi       *proc.BinaryInfo
-	selfMem  *memory
+// maxElems is how many elements of each array, slice or map are checked.
+const maxElems = 1 << 12
 
+var (
 	outOnce sync.Once
+	outMu   sync.Mutex
 	out     io.Writer = os.Stderr
 
-	mu    sync.Mutex
-	owner int64 // goroutine ID holding mu, to detect re-entry
+	active sync.Map // IDs of goroutines running Check, to detect re-entry
 )
 
 // Check reports every string in args that contains one of needles, along
@@ -39,24 +32,38 @@ var (
 // source name of the parameter whose address is boxed in args[i]. Output
 // is appended to the file outPath, or written to stderr if outPath is "".
 //
+// If guard is set, the target function may be called by Check itself, so
+// calls made while checking are ignored. That's only possible for functions
+// in the standard library, where rt's dependencies are; finding the
+// goroutine ID for the guard takes most of the time of a Check.
+//
 // The push linkname lets the injected bodyless declaration in the target
 // package (which can't import rt) refer to this function.
 //
 //go:linkname Check
-func Check(needles []string, depth int, outPath string, fn string, names []string, args []any) {
-	// The target function may be called by delve itself (e.g. if it's in
-	// the standard library), so ignore calls made while checking.
-	gid := goid()
-	if mu.TryLock() {
-		owner = gid
-	} else if owner == gid {
-		return
-	} else {
-		mu.Lock()
-		owner = gid
+func Check(guard bool, needles []string, depth int, outPath string, fn string, names []string, args []any) {
+	if guard {
+		gid := goid()
+		if _, busy := active.LoadOrStore(gid, true); busy {
+			return
+		}
+		defer active.Delete(gid)
 	}
-	defer func() { owner = 0; mu.Unlock() }()
 
+	w := walker{needles: needles, depth: depth, fn: fn}
+	for i, arg := range args {
+		// arg holds *T, where T is the parameter's static type, so that an
+		// interface parameter stays an interface.
+		p := reflect.ValueOf(arg)
+		if p.Kind() != reflect.Pointer || p.IsNil() {
+			continue
+		}
+		w.expr = append(w.expr[:0], names[i]...)
+		w.walk(p.Elem(), 0)
+	}
+	if w.out.Len() == 0 {
+		return
+	}
 	outOnce.Do(func() {
 		if outPath == "" {
 			return
@@ -68,186 +75,202 @@ func Check(needles []string, depth int, outPath string, fn string, names []strin
 		}
 		out = f
 	})
-	initOnce.Do(load)
-	if initErr != nil {
-		fmt.Fprintf(out, "argmatch: %v\n", initErr)
-		return
-	}
-	scope := &proc.EvalScope{BinInfo: bi, Mem: selfMem}
-	cfg := proc.LoadConfig{
-		FollowPointers:     true,
-		MaxVariableRecurse: depth,
-		MaxStringLen:       1 << 16,
-		MaxArrayValues:     1 << 12,
-		MaxStructFields:    -1,
-	}
-	for i := range args {
-		// args[i] is an interface{} holding *T, where T is the parameter's
-		// static type; delve resolves *T from the runtime type.
-		expr := fmt.Sprintf("*(*interface {})(%#x)", uintptr(unsafe.Pointer(&args[i])))
-		shallow := cfg
-		shallow.MaxVariableRecurse = -1
-		box, err := scope.EvalExpression(expr, shallow)
-		if err != nil || len(box.Children) != 1 {
-			fmt.Fprintf(out, "argmatch: %s: cannot load %s: %v\n", fn, names[i], err)
-			continue
-		}
-		// Delve doesn't count dereferencing *T as a level unless T is a
-		// pointer or interface; compensate so depth is relative to T.
-		argCfg := cfg
-		if ptr, ok := box.Children[0].RealType.(*godwarf.PtrType); ok {
-			switch ptr.Type.Common().ReflectKind {
-			case reflect.Ptr, reflect.Interface:
-				argCfg.MaxVariableRecurse++
-			}
-		}
-		box, err = scope.EvalExpression(expr, argCfg)
-		if err != nil || len(box.Children) != 1 || len(box.Children[0].Children) != 1 {
-			fmt.Fprintf(out, "argmatch: %s: cannot load %s: %v\n", fn, names[i], err)
-			continue
-		}
-		arg := &box.Children[0].Children[0]
-		walk(arg, names[i], nil, func(path []string, expr, needle, val string) {
-			fmt.Fprintf(out, "argmatch: value %q contains %q in %s: %s (%s)\n", val, needle, fn, strings.Join(path, " -> "), expr)
-		}, needles)
-	}
+	// One write per call, so that calls' lines aren't interleaved.
+	outMu.Lock()
+	out.Write(w.out.Bytes())
+	outMu.Unlock()
 }
 
-// walk calls report for each string or []byte in v's tree and each of
-// needles it contains, if any named type or interface lies on the path to
-// it. path holds those types.
-func walk(v *proc.Variable, expr string, path []string, report func(path []string, expr, needle, val string), needles []string) {
-	if v.Unreadable != nil || v.DwarfType == nil {
-		return
+// A walker walks one argument at a time. expr and path are stacks: each
+// level of the walk appends to them, and truncates them back when done.
+type walker struct {
+	needles []string
+	depth   int
+	fn      string
+
+	expr []byte // source expression of the current value, e.g. o.P.Name
+	path []step // named types and interfaces on the path to it
+	out  bytes.Buffer
+}
+
+// A step is a named type on the path to a match, or an interface (iface)
+// with its concrete type.
+type step struct {
+	typ, concrete reflect.Type
+}
+
+func (s step) String() string {
+	if s.concrete != nil {
+		return typeName(s.typ) + " (concrete " + typeName(s.concrete) + ")"
 	}
-	typ := v.DwarfType.String()
+	return typeName(s.typ)
+}
+
+// walk checks v and what it contains, adding v's type to the path if it's
+// a named type or an interface. level counts nesting the way delve does
+// when loading a variable with MaxVariableRecurse = depth, so -depth means
+// what it did when argmatch used delve:
+//   - a struct's fields and a map's keys and values are loaded only while
+//     level <= depth, and are one level deeper;
+//   - an array's or slice's elements are always loaded, one level deeper;
+//   - a pointer's target is at the same level, unless it's a pointer or an
+//     interface, which are one level deeper (and a pointer target is only
+//     loaded while level <= depth);
+//   - an interface's dynamic value is at the same level, loaded only while
+//     level <= depth;
+//   - strings are always loaded.
+func (w *walker) walk(v reflect.Value, level int) {
+	n := len(w.path)
+	defer func() { w.path = w.path[:n] }()
+	t := v.Type()
 	switch {
-	case v.Kind == reflect.Interface && len(v.Children) == 1 && v.Children[0].DwarfType != nil:
+	case v.Kind() == reflect.Interface:
+		if v.IsNil() || level > w.depth {
+			return
+		}
 		// Report the interface together with its dynamic type, then
 		// continue below the dynamic value so it isn't reported twice.
-		data := &v.Children[0]
-		path = append(path, fmt.Sprintf("%s (concrete %s)", typ, data.DwarfType.String()))
-		walkValue(data, expr, path, report, needles)
+		data := v.Elem()
+		w.path = append(w.path, step{t, data.Type()})
+		w.walkValue(data, level)
 		return
-	case isNamed(typ):
-		path = append(path, typ)
+	case isNamed(t):
+		w.path = append(w.path, step{typ: t})
 	}
-	walkValue(v, expr, path, report, needles)
+	w.walkValue(v, level)
 }
 
-// walkValue checks v itself, whose type is already accounted for in path,
-// then walks its children.
-func walkValue(v *proc.Variable, expr string, path []string, report func(path []string, expr, needle, val string), needles []string) {
-	if len(path) > 0 {
-		if s, ok := stringValue(v); ok {
-			for _, needle := range needles {
+// walkValue checks v itself, whose type is already accounted for in the
+// path, then walks its contents.
+func (w *walker) walkValue(v reflect.Value, level int) {
+	if s, ok := stringValue(v); ok {
+		if len(w.path) > 0 {
+			for _, needle := range w.needles {
 				if strings.Contains(s, needle) {
-					report(path, expr, needle, s)
+					w.report(s, needle)
 				}
 			}
 		}
+		return
 	}
-	for i := range v.Children {
-		c := &v.Children[i]
-		var cexpr string
-		switch v.Kind {
-		case reflect.Struct:
-			cexpr = expr + "." + c.Name
-		case reflect.Ptr, reflect.Interface:
-			cexpr = expr
-		case reflect.Map:
-			if i%2 == 0 {
-				cexpr = fmt.Sprintf("%s<key %d>", expr, i/2)
-			} else {
-				cexpr = fmt.Sprintf("%s[<key %d>]", expr, i/2)
+	n := len(w.expr)
+	defer func() { w.expr = w.expr[:n] }()
+	switch v.Kind() {
+	case reflect.Pointer:
+		if v.IsNil() {
+			return
+		}
+		switch e := v.Elem(); e.Kind() {
+		case reflect.Interface:
+			w.walk(e, level+1)
+		case reflect.Pointer:
+			if level <= w.depth {
+				w.walk(e, level+1)
 			}
 		default:
-			cexpr = fmt.Sprintf("%s[%d]", expr, i)
+			w.walk(e, level)
 		}
-		walk(c, cexpr, path, report, needles)
+	case reflect.Struct:
+		if level > w.depth {
+			return
+		}
+		t := v.Type()
+		for i := range v.NumField() {
+			w.expr = append(append(w.expr[:n], '.'), t.Field(i).Name...)
+			w.walk(v.Field(i), level+1)
+		}
+	case reflect.Map:
+		if level > w.depth {
+			return
+		}
+		it := v.MapRange()
+		for i := 0; i < maxElems && it.Next(); i++ {
+			w.expr = append(strconv.AppendInt(append(w.expr[:n], "<key "...), int64(i), 10), '>')
+			w.walk(it.Key(), level+1)
+			w.expr = append(strconv.AppendInt(append(w.expr[:n], "[<key "...), int64(i), 10), ">]"...)
+			w.walk(it.Value(), level+1)
+		}
+	case reflect.Slice, reflect.Array:
+		for i := range min(v.Len(), maxElems) {
+			w.expr = append(strconv.AppendInt(append(w.expr[:n], '['), int64(i), 10), ']')
+			w.walk(v.Index(i), level+1)
+		}
 	}
 }
 
+func (w *walker) report(val, needle string) {
+	path := make([]string, len(w.path))
+	for i, s := range w.path {
+		path[i] = s.String()
+	}
+	fmt.Fprintf(&w.out, "argmatch: value %q contains %q in %s: %s (%s)\n", val, needle, w.fn, strings.Join(path, " -> "), w.expr)
+}
+
 // stringValue returns the contents of a string, or of a byte slice or
-// array (as far as delve loaded it).
-func stringValue(v *proc.Variable) (string, bool) {
-	switch v.Kind {
+// array. For byte slices the result shares memory with the slice, so it's
+// only valid while the value is being checked.
+func stringValue(v reflect.Value) (string, bool) {
+	switch v.Kind() {
 	case reflect.String:
-		if v.Value != nil {
-			return constant.StringVal(v.Value), true
+		return v.String(), true
+	case reflect.Slice:
+		if v.Type().Elem().Kind() == reflect.Uint8 {
+			b := v.Bytes()
+			return unsafe.String(unsafe.SliceData(b), len(b)), true
 		}
-	case reflect.Slice, reflect.Array:
-		// Delve gives byte elements Kind reflect.Uint, so check the size.
-		if len(v.Children) == 0 || v.Children[0].RealType == nil || v.Children[0].RealType.Size() != 1 ||
-			(v.Children[0].Kind != reflect.Uint && v.Children[0].Kind != reflect.Uint8) {
-			return "", false
-		}
-		b := make([]byte, len(v.Children))
-		for i, c := range v.Children {
-			if c.Value == nil {
-				return "", false
+	case reflect.Array:
+		if v.Type().Elem().Kind() == reflect.Uint8 {
+			if v.CanAddr() {
+				b := v.Bytes()
+				return unsafe.String(unsafe.SliceData(b), len(b)), true
 			}
-			n, _ := constant.Uint64Val(c.Value)
-			b[i] = byte(n)
+			// e.g. a map value
+			b := make([]byte, v.Len())
+			for i := range b {
+				b[i] = byte(v.Index(i).Uint())
+			}
+			return string(b), true
 		}
-		return string(b), true
 	}
 	return "", false
 }
 
-// isNamed reports whether a DWARF type name is a defined type other than a
-// predeclared basic type, e.g. main.ID or net/http.Header, as opposed to
-// string or a type literal such as []string or *main.Outer.
-func isNamed(t string) bool {
-	switch t {
-	case "", "bool", "string", "int", "int8", "int16", "int32", "int64",
-		"uint", "uint8", "uint16", "uint32", "uint64", "uintptr",
-		"float32", "float64", "complex64", "complex128", "unsafe.Pointer":
-		return false
-	}
-	for _, p := range []string{"*", "[", "map[", "chan ", "<-chan ", "func(", "struct {", "interface {"} {
-		if strings.HasPrefix(t, p) {
-			return false
+// isNamed reports whether t is a defined type other than a predeclared one,
+// e.g. main.ID or net/http.Header, as opposed to string, error or a type
+// literal such as []string or *main.Outer.
+func isNamed(t reflect.Type) bool {
+	return t.Name() != "" && t.PkgPath() != ""
+}
+
+// typeName returns t's name with full package paths, e.g. net/http.Header
+// or *main.Outer, as DWARF (and so delve) names it.
+func typeName(t reflect.Type) string {
+	if t.Name() != "" {
+		if t.PkgPath() == "" {
+			return t.Name() // predeclared
 		}
+		// Type arguments of generic types are already fully qualified.
+		return t.PkgPath() + "." + t.Name()
 	}
-	return true
-}
-
-func load() {
-	exe, err := os.Executable()
-	if err != nil {
-		initErr = err
-		return
+	switch t.Kind() {
+	case reflect.Pointer:
+		return "*" + typeName(t.Elem())
+	case reflect.Slice:
+		return "[]" + typeName(t.Elem())
+	case reflect.Array:
+		return "[" + strconv.Itoa(t.Len()) + "]" + typeName(t.Elem())
+	case reflect.Map:
+		return "map[" + typeName(t.Key()) + "]" + typeName(t.Elem())
+	case reflect.Chan:
+		switch t.ChanDir() {
+		case reflect.RecvDir:
+			return "<-chan " + typeName(t.Elem())
+		case reflect.SendDir:
+			return "chan<- " + typeName(t.Elem())
+		}
+		return "chan " + typeName(t.Elem())
 	}
-	// The entry point is needed to find the load address of PIE binaries.
-	auxv, err := os.ReadFile("/proc/self/auxv")
-	if err != nil {
-		initErr = err
-		return
-	}
-	bi = proc.NewBinaryInfo(runtime.GOOS, runtime.GOARCH)
-	if err := bi.LoadBinaryInfo(exe, linutil.EntryPointFromAuxv(auxv, bi.Arch.PtrSize()), nil); err != nil {
-		initErr = err
-		return
-	}
-	f, err := os.Open("/proc/self/mem")
-	if err != nil {
-		initErr = err
-		return
-	}
-	selfMem = &memory{f}
-}
-
-// memory reads the program's own memory through /proc/self/mem, so that
-// following a bad pointer yields an error rather than a segfault.
-type memory struct{ f *os.File }
-
-func (m *memory) ReadMemory(buf []byte, addr uint64) (int, error) {
-	return m.f.ReadAt(buf, int64(addr))
-}
-
-func (m *memory) WriteMemory(addr uint64, data []byte) (int, error) {
-	return 0, fmt.Errorf("argmatch: memory is read-only")
+	return t.String() // func, struct and interface literals
 }
 
 func goid() int64 {

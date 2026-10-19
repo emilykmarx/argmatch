@@ -60,8 +60,8 @@ done
 
 The program is never stopped or attached to. All instrumentation happens at compile time:
 
-- **Compile time ([main.go](main.go)):** every package is compiled with `-N -l`. In the package that contains the target function, a call is inserted at the top of the function. It passes the address of the receiver and each argument, boxed so the static type survives (an interface argument stays an interface). The edit adds no lines, so line numbers in panics and debug info stay correct.
-- **Run time ([rt/rt.go](rt/rt.go)):** a small helper package linked into the program loads the binary's own debug info with delve. It reads the program's own memory through `/proc/self/mem`, so a bad pointer gives an error, not a crash. It then calls `EvalExpression("*(*interface {})(0x…)")` with `FollowPointers` and `MaxVariableRecurse = -depth`. Delve does all the type resolution, pointer following and loading; argmatch only walks the loaded tree and collects named types and interfaces.
+- **Compile time ([main.go](main.go)):** in the package that contains the target function, a call is inserted at the top of the function. It passes the address of the receiver and each argument, boxed so the static type survives (an interface argument stays an interface). The edit adds no lines, so line numbers in panics and debug info stay correct. Packages are otherwise compiled normally, with optimizations.
+- **Run time ([rt/rt.go](rt/rt.go)):** a small helper package linked into the program walks each argument with `reflect`. It follows pointers, interfaces, structs (including unexported fields), maps, arrays and slices down to `-depth`, checks every string and byte slice it reaches, and collects the named types and interfaces on the way. A check takes about 1.3 µs for `F` in the example when nothing matches.
 
 ## Tested
 
@@ -69,23 +69,23 @@ The program is never stopped or attached to. All instrumentation happens at comp
 
 Also tested by hand:
 
-- **Standard library:** `-func 'net.(*sysDialer).dialSerial' -match 127.0.0.1` reports `net.sysDialer (sd.address)`. That's a package delve itself depends on.
-- **Stack log from prombench:** Prometheus built with `-stacklog` set to a prometheus-meta pod log (92k connections, 252 distinct functions) builds in 25 s. Running it with `-match prometheus.yml` reports matches in `main.reloadConfig`, `web.(*Handler).Run`, `route.(*Router).handle` and the promhttp handlers.
-- **Edge cases:** unnamed and `_` parameters, a generic receiver (`main.G[main.Name]`), `any` holding a plain string, and two goroutines calling the function at the same time all work. The depth limit cuts off deeper struct nesting as expected.
+- **Standard library:** `-func 'net.(*sysDialer).dialSerial' -match 127.0.0.1` reports `net.sysDialer (sd.address)`.
+- **Stack log from prombench:** Prometheus built with `-stacklog` set to a prometheus-meta pod log (92k connections, 252 distinct functions) builds in 30 s. Run with `-match prometheus.yml` and its config file at a path containing that string, it reports the `--config.file` flag value in `web.(*Handler).testReady`. Most paths to that value, including all of them from 8 other functions such as `main.reloadConfig`, go through closures and are missed (see the closure limitation below). [closure-gap/](closure-gap/) compares this with an earlier version that followed closures.
+- **Edge cases:** unnamed and `_` parameters, a generic receiver (`main.G[main.Name]`), `any` holding a plain string, wrapped errors, unexported map keys, byte arrays stored as map values, pointers to pointers, and two goroutines calling the function at the same time all work. The depth limit cuts off deeper struct nesting as expected.
 - **Byte slices:** `[]byte` and byte arrays are matched like strings. A plain `[]byte` argument prints nothing, but a named `type B []byte`, a `[]byte` field in a named struct, and a `[]byte` in an `any` are reported.
 
 ## Notes
 
-- **Delve version:** it uses upstream delve v1.26.3, not the local fork in `../../delve`, because the fork can't read Go 1.26 maps. `EvalExpression` is the same in both. v1.26.3 is used instead of v1.27.2 because its dependencies are old enough for Prometheus's (e.g. `golang.org/x/sys` v0.29.0).
-- **Matching the program's build:** the helper and delve are built against the program's versions of any modules both use, and with the outer `go build`'s `-tags`, `-race`, `-msan`, `-asan`, `-trimpath`, `-buildmode`, `-pgo` and `-installsuffix` flags. That keeps packages shared with the program identical, which the linker requires.
-- **What `-depth` counts:** it's delve's `MaxVariableRecurse`. Pointers don't count as a level, so `-depth 2` reaches `l.X.X.N` in `L1{L2{L3{N}}}` and `-depth 1` doesn't.
-- **Function names** use delve's naming: `pkg/path.Func`, `pkg.T.M` or `pkg.(*T).M`, which is also how they appear in stacktraces. Functions written in assembly can't be instrumented.
+- **Matching the program's build:** the helper depends only on the standard library. It's built with the outer `go build`'s `-tags`, `-race`, `-msan`, `-asan`, `-trimpath`, `-buildmode`, `-pgo` and `-installsuffix` flags, which keeps the standard library packages it shares with the program identical, as the linker requires.
+- **What `-depth` counts:** nesting of structs, maps, arrays and slices. Pointers don't count as a level, except a pointer to a pointer or to an interface, so `-depth 2` reaches `l.X.X.N` in `L1{L2{L3{N}}}` and `-depth 1` doesn't. Strings are always checked once reached.
+- **Function names** are as in stacktraces: `pkg/path.Func`, `pkg.T.M` or `pkg.(*T).M`. Functions written in assembly can't be instrumented.
 - **Names in stack logs** are mapped to declarations by `stacklog.EnclosingFns`, which `parse` uses too. Closures and `go`/`defer` wrappers (`pkg.F.func1.2`, `pkg.F.gowrap1`) mean the function that contains them, and method values (`pkg.T.M-fm`) mean the method. A closure in an inlined function is named after both functions (`pkg.(*T).Run.helper.func5`), and both are checked (`pkg.helper` and `pkg.(*T).Run`). That's guessed from the name, so it can't recover an inlined function from another package, and a value-receiver method inlined into a function is misread. The comment on `EnclosingFns` describes an exact alternative using the frames' file:line.
-- **What is matched:** string values and `[]byte`/byte array contents. A value matches if it contains the *full* match string anywhere, so `-match needle` reports `"xneedlex"`. The output shows both the match string and the whole value that contained it. A value that contains several match strings gives one line per string. Strings are loaded up to 64 KiB and arrays up to 4096 elements.
-- **First build is slow:** it recompiles the standard library unoptimized, about 6 s here. The cache is keyed on the settings, the wrapper binary and the helper's sources, so later builds are fast.
+- **What is matched:** string values and `[]byte`/byte array contents. A value matches if it contains the *full* match string anywhere, so `-match needle` reports `"xneedlex"`. The output shows both the match string and the whole value that contained it. A value that contains several match strings gives one line per string. Strings and byte slices are checked whole; only the first 4096 elements of other arrays and slices, and entries of maps, are walked.
+- **Map keys** in paths (`h<key 0>`) are numbered in `reflect`'s iteration order, which is random, so the numbers can differ between runs.
+- **First build is slow:** every package is rebuilt once, because the build cache is keyed on the settings, the wrapper binary and the helper's sources. Later builds with the same settings are fast.
 - **Limitations:**
-  - If the program's version of a shared module is too old for delve to compile against, the build fails.
-  - Calls to the target function made by delve's own code while a check is running are skipped, to avoid infinite recursion.
+  - **Closures aren't followed.** A func value (a closure, method value or `http.HandlerFunc`) is a pointer to its code plus the variables it captured, and only the binary's DWARF debug info records the captured variables' types, so `reflect` can't see them. Anything reachable only through a closure's captured variables is missed. In Prometheus that's a lot: config reloaders, HTTP handlers and run-group actors are closures that capture `*web.Handler`. See [closure-gap/](closure-gap/) and the commit that introduced the `reflect` version for the measurements and ways to close the gap.
+  - Calls to a standard library target function made by the helper itself while a check is running are skipped, to avoid infinite recursion.
 
 ## Prometheus
 

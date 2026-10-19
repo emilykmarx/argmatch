@@ -7,10 +7,12 @@
 //	go build -toolexec "/path/to/argmatch -func main.ID.F -match needle -depth 5" .
 //	ARGMATCH_FUNC=main.ID.F ARGMATCH_MATCH=needle GOFLAGS=-toolexec=/path/to/argmatch go build .
 //	go build -toolexec "/path/to/argmatch -func main.ID.F -matchfile /abs/path/matches.txt" .
+//	go build -toolexec "/path/to/argmatch -stacklog /abs/path/stacks.log -match needle" .
 //
 // The function may be in any package of the build, including the standard
 // library, and is named as delve names it: pkg/path.Func, pkg/path.T.M or
-// pkg/path.(*T).M.
+// pkg/path.(*T).M. With -stacklog, every function in the stacktraces of a
+// connection log (in the format conftamer parses) is checked as well.
 //
 // Matches are printed to the program's stderr, or appended to the file
 // given by -out.
@@ -30,12 +32,16 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
+
+	"golang.org/x/tools/gopls/conftamer/stacklog"
 )
 
 const (
@@ -47,7 +53,8 @@ const (
 // Each flag defaults to an environment variable, for use with
 // GOFLAGS=-toolexec=/path/to/argmatch (GOFLAGS values can't contain spaces).
 var (
-	funcName  = flag.String("func", os.Getenv("ARGMATCH_FUNC"), "function to check, as named by delve (required; env ARGMATCH_FUNC)")
+	funcName  = flag.String("func", os.Getenv("ARGMATCH_FUNC"), "function to check, as named by delve (env ARGMATCH_FUNC)")
+	stackLog  = flag.String("stacklog", os.Getenv("ARGMATCH_STACKLOG"), "absolute path of a log of connection stacktraces; every function in the stacks is checked, except those stacklog.IgnoreFn ignores (env ARGMATCH_STACKLOG)")
 	needle    = flag.String("match", os.Getenv("ARGMATCH_MATCH"), "string to look for (env ARGMATCH_MATCH)")
 	matchFile = flag.String("matchfile", os.Getenv("ARGMATCH_MATCHFILE"), "absolute path of a file of strings to look for, one per line, in addition to -match; blank lines are ignored (env ARGMATCH_MATCHFILE)")
 	depth     = flag.Int("depth", envInt("ARGMATCH_DEPTH", 5), "how many levels of nested structs, arrays, maps and pointers-to-pointers to load (delve's MaxVariableRecurse; env ARGMATCH_DEPTH)")
@@ -57,6 +64,80 @@ var (
 
 // needles holds -match and the lines of -matchfile.
 var needles []string
+
+// funcs holds the functions to check, without any "[...]": -func, and the
+// functions in the stacks of -stacklog.
+var funcs = map[string]bool{}
+
+// loadFuncs fills in funcs. Parsing a large log takes a while and the go
+// command runs the wrapper once per package, so the functions found in a
+// log are cached in the user cache directory, keyed on the log's path,
+// size and modification time, and on this executable (whose parser may
+// have changed).
+func loadFuncs() {
+	if *funcName != "" {
+		funcs[strings.ReplaceAll(*funcName, "[...]", "")] = true
+	}
+	if *stackLog == "" {
+		return
+	}
+	if !filepath.IsAbs(*stackLog) {
+		fmt.Fprintf(os.Stderr, "argmatch: -stacklog %s must be an absolute path\n", *stackLog)
+		os.Exit(2)
+	}
+	fi, err := os.Stat(*stackLog)
+	check(err)
+	self, err := os.Executable()
+	check(err)
+	selfInfo, err := os.Stat(self)
+	check(err)
+	var cache string
+	if dir, err := os.UserCacheDir(); err == nil {
+		key := sha256.Sum256(fmt.Appendf(nil, "%q %d %d %q %d %d", *stackLog, fi.Size(), fi.ModTime().UnixNano(),
+			self, selfInfo.Size(), selfInfo.ModTime().UnixNano()))
+		cache = filepath.Join(dir, "argmatch", fmt.Sprintf("%x.funcs", key[:8]))
+		if data, err := os.ReadFile(cache); err == nil {
+			for _, fn := range strings.Fields(string(data)) {
+				funcs[fn] = true
+			}
+			return
+		}
+	}
+	f, err := os.Open(*stackLog)
+	check(err)
+	defer f.Close()
+	found := map[string]bool{}
+	scanner := bufio.NewScanner(f)
+	for {
+		conn, err := stacklog.ParseOneConn(scanner)
+		check(err)
+		if conn.LastConn {
+			break
+		}
+		for _, line := range conn.Stacks {
+			if frame, ok := stacklog.FrameFunc(line); ok {
+				// E.g. check closures' enclosing functions instead.
+				for _, fn := range stacklog.EnclosingFns(frame) {
+					found[strings.ReplaceAll(fn, "[...]", "")] = true
+				}
+			}
+		}
+	}
+	check(scanner.Err())
+	list := slices.Sorted(maps.Keys(found))
+	for _, fn := range list {
+		funcs[fn] = true
+	}
+	if cache != "" {
+		// Write and rename, so concurrent compiles never see a partial file.
+		if os.MkdirAll(filepath.Dir(cache), 0o755) == nil {
+			tmp := fmt.Sprintf("%s.%d", cache, os.Getpid())
+			if os.WriteFile(tmp, []byte(strings.Join(list, "\n")+"\n"), 0o644) == nil {
+				os.Rename(tmp, cache)
+			}
+		}
+	}
+}
 
 // loadNeedles returns -match and the non-blank lines of -matchfile, without
 // duplicates. Each line is used as is, apart from a trailing \r.
@@ -96,15 +177,16 @@ func envInt(name string, def int) int {
 
 func main() {
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: go build -toolexec \"%s -func pkg.Func {-match string | -matchfile /path} [-depth n]\" ...\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "usage: go build -toolexec \"%s {-func pkg.Func | -stacklog /path} {-match string | -matchfile /path} [-depth n]\" ...\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
-	if *funcName == "" || *needle == "" && *matchFile == "" || flag.NArg() == 0 {
+	if *funcName == "" && *stackLog == "" || *needle == "" && *matchFile == "" || flag.NArg() == 0 {
 		flag.Usage()
 		os.Exit(2)
 	}
 	needles = loadNeedles()
+	loadFuncs()
 	if *rtDir == "" {
 		exe, err := os.Executable()
 		check(err)
@@ -155,7 +237,7 @@ func printToolID(tool string) {
 		rtFiles, err := filepath.Glob(filepath.Join(*rtDir, "rt", "*.go"))
 		check(err)
 		h := sha256.New()
-		fmt.Fprintf(h, "%q %q %d %q ", *funcName, needles, *depth, *outPath)
+		fmt.Fprintf(h, "%q %q %d %q ", slices.Sorted(maps.Keys(funcs)), needles, *depth, *outPath)
 		for _, f := range append([]string{self, filepath.Join(*rtDir, "go.mod"), filepath.Join(*rtDir, "go.sum")}, rtFiles...) {
 			b, err := os.ReadFile(f)
 			check(err)
@@ -173,9 +255,10 @@ func compileArgs(tool string, args []string, tmp string) []string {
 	if i := slices.Index(args, "-p"); i >= 0 && i+1 < len(args) {
 		pkg = args[i+1]
 	}
+	isStd := slices.Contains(args, "-std")
 	args = append([]string{"-N", "-l"}, args...)
 	isMain := pkg == "main" && os.Getenv(nestedEnv) == ""
-	injectedMain := false
+	injectedMain, declared := false, false
 	for i, path := range args {
 		if !strings.HasSuffix(path, ".go") {
 			continue
@@ -191,13 +274,32 @@ func compileArgs(tool string, args []string, tmp string) []string {
 		}
 		var edits []edit
 		for _, d := range f.Decls {
-			if fd, ok := d.(*ast.FuncDecl); ok && matchesFunc(pkg, fd) {
-				if fd.Body == nil {
-					fmt.Fprintf(os.Stderr, "argmatch: %s has no Go body; cannot instrument it\n", *funcName)
+			fd, ok := d.(*ast.FuncDecl)
+			if !ok {
+				continue
+			}
+			name, explicit, ok := matchesFunc(pkg, isStd, fd)
+			if !ok || fd.Type.Params.NumFields() == 0 && fd.Recv.NumFields() == 0 {
+				continue // nothing to check
+			}
+			if fd.Body == nil {
+				if explicit {
+					fmt.Fprintf(os.Stderr, "argmatch: %s has no Go body; cannot instrument it\n", name)
 					os.Exit(1)
 				}
-				edits = append(edits, instrument(fset, f, fd, len(src))...)
+				continue
 			}
+			edits = append(edits, instrument(fset, fd, name)...)
+		}
+		if len(edits) > 0 && !declared {
+			// The target package can't import rt (it may be one of rt's
+			// own dependencies), so refer to rt.Check by its linker name
+			// instead, declaring it once per package.
+			edits = append(edits,
+				edit{fset.Position(f.Name.End()).Offset, `; import _ "unsafe"`},
+				edit{len(src), fmt.Sprintf("\n//go:linkname %s %s.Check\nfunc %s([]string, int, string, string, []string, []interface{})\n", checkFn, rtPkg, checkFn)},
+			)
+			declared = true
 		}
 		if isMain && !injectedMain {
 			edits = append(edits, edit{fset.Position(f.Name.End()).Offset, fmt.Sprintf("; import _ %q", rtPkg)})
@@ -236,8 +338,29 @@ type edit struct {
 	text string
 }
 
-// matchesFunc reports whether fd, in package pkg, is the target function.
-func matchesFunc(pkg string, fd *ast.FuncDecl) bool {
+// matchesFunc reports whether fd, in package pkg, is one of the functions
+// to check, and returns its name as delve names it. explicit reports
+// whether it was given by -func. Functions found only in -stacklog are
+// skipped if stacklog.IgnoreFn ignores them; isStd reports whether pkg is
+// in the standard library.
+func matchesFunc(pkg string, isStd bool, fd *ast.FuncDecl) (name string, explicit, ok bool) {
+	name = funcDeclName(pkg, fd)
+	if name == "" {
+		return "", false, false
+	}
+	short := strings.ReplaceAll(name, "[...]", "")
+	if *funcName != "" && short == strings.ReplaceAll(*funcName, "[...]", "") {
+		return name, true, true
+	}
+	if !funcs[short] || stacklog.IgnoreFn(name, func(string) bool { return isStd }) {
+		return "", false, false
+	}
+	return name, false, true
+}
+
+// funcDeclName returns the name delve gives fd, in package pkg, or "" if
+// it can't tell.
+func funcDeclName(pkg string, fd *ast.FuncDecl) string {
 	name := pkg + "." + fd.Name.Name
 	if fd.Recv != nil && len(fd.Recv.List) == 1 {
 		typ, star := fd.Recv.List[0].Type, false
@@ -253,7 +376,7 @@ func matchesFunc(pkg string, fd *ast.FuncDecl) bool {
 		}
 		id, ok := typ.(*ast.Ident)
 		if !ok {
-			return false
+			return ""
 		}
 		recv := id.Name
 		if generic {
@@ -264,12 +387,12 @@ func matchesFunc(pkg string, fd *ast.FuncDecl) bool {
 		}
 		name = pkg + "." + recv + "." + fd.Name.Name
 	}
-	return name == *funcName || strings.ReplaceAll(name, "[...]", "") == *funcName
+	return name
 }
 
-// instrument returns the edits that make fd call rt.Check with the
-// addresses of its receiver and parameters, naming unnamed ones.
-func instrument(fset *token.FileSet, f *ast.File, fd *ast.FuncDecl, size int) []edit {
+// instrument returns the edits that make fd, named fn, call rt.Check with
+// the addresses of its receiver and parameters, naming unnamed ones.
+func instrument(fset *token.FileSet, fd *ast.FuncDecl, fn string) []edit {
 	off := func(p token.Pos) int { return fset.Position(p).Offset }
 	var edits []edit
 	var names, addrs []string
@@ -301,14 +424,8 @@ func instrument(fset *token.FileSet, f *ast.File, fd *ast.FuncDecl, size int) []
 		quotedNeedles[i] = strconv.Quote(n)
 	}
 	call := fmt.Sprintf("%s([]string{%s}, %d, %q, %q, []string{%s}, []interface{}{%s});",
-		checkFn, strings.Join(quotedNeedles, ", "), *depth, *outPath, *funcName, strings.Join(quoted, ", "), strings.Join(addrs, ", "))
-	return append(edits,
-		edit{off(fd.Body.Lbrace) + 1, call},
-		// The target package can't import rt (it may be one of rt's own
-		// dependencies), so refer to rt.Check by its linker name instead.
-		edit{off(f.Name.End()), `; import _ "unsafe"`},
-		edit{size, fmt.Sprintf("\n//go:linkname %s %s.Check\nfunc %s([]string, int, string, string, []string, []interface{})\n", checkFn, rtPkg, checkFn)},
-	)
+		checkFn, strings.Join(quotedNeedles, ", "), *depth, *outPath, fn, strings.Join(quoted, ", "), strings.Join(addrs, ", "))
+	return append(edits, edit{off(fd.Body.Lbrace) + 1, call})
 }
 
 // withRT adds rt and its dependencies to the -importcfg in args.
@@ -359,7 +476,7 @@ func rtExports(tool string) []string {
 		}
 		return `"` + s + `"`
 	}
-	toolexec := strings.Join([]string{quote(self), "-func", quote(*funcName), "-match", quote(*needle),
+	toolexec := strings.Join([]string{quote(self), "-func", quote(*funcName), "-stacklog", quote(*stackLog), "-match", quote(*needle),
 		"-matchfile", quote(*matchFile), "-depth", strconv.Itoa(*depth), "-out", quote(*outPath), "-rtdir", quote(*rtDir)}, " ")
 	tmp, err := os.MkdirTemp("", "argmatch-mod")
 	check(err)
@@ -396,6 +513,12 @@ func alignedModfile(goCmd, dir string) string {
 		fmt.Fprintln(os.Stderr, "argmatch: listing the program's modules:", err)
 		os.Exit(1)
 	}
+	// The copy is in another directory, so make rt's own local replacements
+	// absolute.
+	mod = regexp.MustCompile(`(?m)^(replace \S+ => )(\.\.?/\S*)$`).ReplaceAllFunc(mod, func(line []byte) []byte {
+		prefix, path, _ := strings.Cut(string(line), "=> ")
+		return []byte(prefix + "=> " + filepath.Join(*rtDir, path))
+	})
 	mod = append(mod, '\n')
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		if f := strings.Fields(line); len(f) >= 2 {

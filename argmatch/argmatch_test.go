@@ -9,19 +9,36 @@ import (
 	"testing"
 )
 
-// TestExample builds testdata/example under argmatch with -match, runs it,
-// and checks the matches reported for F.
-func TestExample(t *testing.T) {
-	got := runExample(t, "-match", "needle")
-	want := `argmatch: value "needle" contains "needle" in main.ID.F: main.ID (id_recvr)
+// wantF is the output for F with -match needle.
+const wantF = `argmatch: value "needle" contains "needle" in main.ID.F: main.ID (id_recvr)
 argmatch: value "needle" contains "needle" in main.ID.F: main.ID2 (id_arg)
 argmatch: value "needle" contains "needle" in main.ID.F: main.Hier (h<key 0>)
 argmatch: value "needle" contains "needle" in main.ID.F: main.Named -> main.ID3 (in.Name)
 argmatch: value "needle" contains "needle" in main.ID.F: main.Outer -> main.Inner -> main.ID4 (o.P.Name)
 argmatch: value "needle" contains "needle" in main.ID.F: main.Iface (concrete main.ID5) (i)
 `
-	if got != want {
-		t.Errorf("matches:\n%s\nwant:\n%s", got, want)
+
+// TestExample builds testdata/example under argmatch with -match, runs it,
+// and checks the matches reported for F.
+func TestExample(t *testing.T) {
+	got := runExample(t, "-func", "main.ID.F", "-match", "needle")
+	if got != wantF {
+		t.Errorf("matches:\n%s\nwant:\n%s", got, wantF)
+	}
+}
+
+// TestStackLog checks that the functions in the stacks of -stacklog are
+// checked. testdata/stacks.log has F, a closure in F (which means F),
+// main.main and standard library functions, which are all ignored, so the
+// output is the same as for -func main.ID.F.
+func TestStackLog(t *testing.T) {
+	stacks, err := filepath.Abs(filepath.Join("testdata", "stacks.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := runExample(t, "-stacklog", `"`+stacks+`"`, "-match", "needle")
+	if got != wantF {
+		t.Errorf("matches:\n%s\nwant:\n%s", got, wantF)
 	}
 }
 
@@ -34,7 +51,7 @@ func TestMatchFile(t *testing.T) {
 	if err := os.WriteFile(matches, []byte("eedl\nneedle\n\nnot present\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	got := runExample(t, "-matchfile", `"`+matches+`"`)
+	got := runExample(t, "-func", "main.ID.F", "-matchfile", `"`+matches+`"`)
 	var want strings.Builder
 	for _, m := range []string{
 		`main.ID (id_recvr)`,
@@ -52,8 +69,8 @@ func TestMatchFile(t *testing.T) {
 	}
 }
 
-// runExample builds testdata/example under argmatch checking F with the
-// given extra wrapper flags, runs it, and returns the matches it reports.
+// runExample builds testdata/example under argmatch with the given wrapper
+// flags, runs it, and returns the matches it reports.
 func runExample(t *testing.T, flags ...string) string {
 	t.Helper()
 	if runtime.GOOS != "linux" {
@@ -71,7 +88,7 @@ func runExample(t *testing.T, flags ...string) string {
 	run(t, rtDir, "go", "build", "-o", wrapper, ".")
 
 	out := filepath.Join(tmp, "out.txt")
-	toolexec := strings.Join(append([]string{`"` + wrapper + `"`, "-func", "main.ID.F",
+	toolexec := strings.Join(append([]string{`"` + wrapper + `"`,
 		"-out", `"` + out + `"`, "-rtdir", `"` + rtDir + `"`}, flags...), " ")
 	example := filepath.Join(tmp, "example")
 	run(t, filepath.Join(rtDir, "testdata", "example"), "go", "build", "-toolexec", toolexec, "-o", example, ".")

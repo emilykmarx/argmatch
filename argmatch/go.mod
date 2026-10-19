@@ -2,7 +2,13 @@ module argmatch
 
 go 1.24
 
-require github.com/go-delve/delve v1.26.3
+require (
+	github.com/go-delve/delve v1.26.3
+	golang.org/x/tools/gopls/conftamer/stacklog v0.0.0
+)
+
+// The stack log parser shared with conftamer's parse package.
+replace golang.org/x/tools/gopls/conftamer/stacklog => ../../golang.org-x-tools/gopls/conftamer/stacklog
 
 require (
 	github.com/cilium/ebpf v0.11.0 // indirect

@@ -21,7 +21,7 @@ The settings can also come from the environment, which is how to use it with a b
 ARGMATCH_FUNC=main.ID.F ARGMATCH_MATCH=needle ARGMATCH_DEPTH=5 ARGMATCH_OUT=/tmp/argmatch.txt GOFLAGS=-toolexec=$A go build .
 ```
 
-To check against several strings, put them in a file, one per line, and pass it with `-matchfile` (env `ARGMATCH_MATCHFILE`). Every value is checked against every string, and each output line names the string that matched. `-matchfile` can be combined with `-match`. The file's path must be absolute, because the go command runs the wrapper in each package's directory. Lines are used exactly as written, including leading and trailing spaces; blank lines are ignored. The strings are read at build time, so rebuild after editing the file.
+To check against several strings, put them in a file, one per line, and pass it with `-matchfile` (env `ARGMATCH_MATCHFILE`). Every value is checked against every string, and each output line names the string that matched. `-matchfile` can be combined with `-match`. The file's path must be absolute, because the go command runs the wrapper in each package's directory. Lines are used exactly as written, including leading and trailing spaces; blank lines and lines starting with `#` are ignored, so a match string can't start with `#`. The strings are read at build time, so rebuild after editing the file.
 
 ```sh
 printf 'needle\needl\n' > /tmp/matches.txt
@@ -42,19 +42,49 @@ Parsing a large log takes about a second, and the go command runs the wrapper on
 
 The wrapper path must be absolute, which is why it's set from `$PWD`. Matches are printed while the program runs, not during the build. By default they go to stderr. With `-out file` (env `ARGMATCH_OUT`) the program appends them to that file instead, so they can't be interleaved with the program's own stderr output. A relative path is resolved against the program's working directory when it runs, and if the file can't be opened, output falls back to stderr. `-depth` defaults to 5, so you can leave it off.
 
+Matches are written as CSV, one row per match, with these columns:
+
+| Column | Contents |
+|---|---|
+| `needle` | the match string |
+| `haystack` | the whole value that contained it |
+| `function` | the instrumented function |
+| `expression` | the path from the parameter to the value, e.g. `o.P.Name` |
+| `closure` | `true` if a closure is on the path, else `false` |
+| `types` and every column after it | one per step of the path from the parameter down to the match, in order |
+
+A step of the path is one of:
+- a named type, e.g. `main.Outer`;
+- an interface, written with its concrete type first, e.g. `main.ID5 (implements main.Iface)`;
+- a closure or method value, written `closure <function>`, e.g. `closure main.(*Handler).Apply-fm`.
+
+Rows have as many step columns as their path has steps, so rows differ in length. The header names only the first step column (`types`). The header is written when the output starts: once at the top of stderr, or when the `-out` file is new or empty, so appending to earlier output doesn't repeat it. Errors, such as an argument that can't be loaded, always go to stderr as plain text, never into the CSV.
+
 Output for `F` in `testdata/example/main.go`:
 
 ```
-argmatch: value "needle" contains "needle" in main.ID.F: main.ID (id_recvr)
-argmatch: value "needle" contains "needle" in main.ID.F: main.ID2 (id_arg)
-argmatch: value "needle" contains "needle" in main.ID.F: main.Hier (h<key 0>)
-argmatch: value "needle" contains "needle" in main.ID.F: main.Named -> main.ID3 (in.Name)
-argmatch: value "needle" contains "needle" in main.ID.F: main.Outer -> main.Inner -> main.ID4 (o.P.Name)
-argmatch: value "needle" contains "needle" in main.ID.F: main.Iface (concrete main.ID5) (i)
+needle,haystack,function,expression,closure,types
+needle,needle,main.ID.F,id_recvr,false,main.ID
+needle,needle,main.ID.F,id_arg,false,main.ID2
+needle,needle,main.ID.F,h<key 0>,false,main.Hier
+needle,needle,main.ID.F,in.Name,false,main.Named,main.ID3
+needle,needle,main.ID.F,o.P.Name,false,main.Outer,main.Inner,main.ID4
+needle,needle,main.ID.F,i,false,main.ID5 (implements main.Iface)
 done
 ```
 
-`arr []string` correctly gives no output. Each line shows the match string, the whole value that contained it, the function, the named types from the argument down to the match, and the path to the value in brackets.
+`arr []string` correctly gives no output.
+
+A match reached through a func value's captured variables has `closure` set to `true`, and a `closure <function>` step at its place in the path. The expression shows the captured variable as `[captured <variable>]`, with `receiver` for a method value's receiver. For `G` in the example:
+
+```
+needle,haystack,function,expression,closure,types
+needle,needle,main.G,r.Fn[captured receiver].Path,true,main.Reloader,closure main.(*Handler).Apply-fm,main.Handler,main.ID
+needle,needle,main.G,named[captured named].Name,true,closure main.main.func1,main.Named,main.ID3
+needle,needle,main.G,basic[captured needle],true,closure main.main.func2
+```
+
+A closure counts as a non-basic type on the path, so a plain string it captured is reported, as in the last row.
 
 ## How it works
 
@@ -65,12 +95,12 @@ The program is never stopped or attached to. All instrumentation happens at comp
 
 ## Tested
 
-`go test .` builds the example under argmatch and checks the matches for `F` three ways: with `-match needle` against the output above, with a match file, and with `-stacklog testdata/stacks.log` and no `-func`. It takes a few seconds (longer with a cold build cache) and is skipped by `go test -short`.
+`go test .` builds the example under argmatch and checks the matches for `F` three ways: with `-match needle` against the output above, with a match file, and with `-stacklog testdata/stacks.log` and no `-func`. It also checks the closure output for `G` above. It takes a few seconds (longer with a cold build cache) and is skipped by `go test -short`.
 
 Also tested by hand:
 
-- **Standard library:** `-func 'net.(*sysDialer).dialSerial' -match 127.0.0.1` reports `net.sysDialer (sd.address)`. That's a package delve itself depends on.
-- **Stack log from prombench:** Prometheus built with `-stacklog` set to a prometheus-meta pod log (92k connections, 252 distinct functions) builds in 25 s. Running it with `-match prometheus.yml` reports matches in `main.reloadConfig`, `web.(*Handler).Run`, `route.(*Router).handle` and the promhttp handlers.
+- **Standard library:** `-func 'net.(*sysDialer).dialSerial' -match 127.0.0.1` reports `127.0.0.1:<port>` at `sd.address` with type `net.sysDialer`. That's a package delve itself depends on.
+- **Stack log from prombench:** Prometheus built with `-stacklog` set to a prometheus-meta pod log (92k connections, 252 distinct functions) builds in 25 s. Running it with `-match prometheus.yml` reports matches in `main.reloadConfig`, `web.(*Handler).Run`, `route.(*Router).handle` and the promhttp handlers. Nearly all of them (377 of 384 distinct rows) are through closures, e.g. expression `rls[2].reloader[captured receiver].flagsMap[<key 3>]` with steps `main.reloader`, `closure github.com/prometheus/prometheus/web.(*Handler).ApplyConfig-fm`, `github.com/prometheus/prometheus/web.Handler`.
 - **Edge cases:** unnamed and `_` parameters, a generic receiver (`main.G[main.Name]`), `any` holding a plain string, and two goroutines calling the function at the same time all work. The depth limit cuts off deeper struct nesting as expected.
 - **Byte slices:** `[]byte` and byte arrays are matched like strings. A plain `[]byte` argument prints nothing, but a named `type B []byte`, a `[]byte` field in a named struct, and a `[]byte` in an `any` are reported.
 
@@ -81,7 +111,7 @@ Also tested by hand:
 - **What `-depth` counts:** it's delve's `MaxVariableRecurse`. Pointers don't count as a level, so `-depth 2` reaches `l.X.X.N` in `L1{L2{L3{N}}}` and `-depth 1` doesn't.
 - **Function names** use delve's naming: `pkg/path.Func`, `pkg.T.M` or `pkg.(*T).M`, which is also how they appear in stacktraces. Functions written in assembly can't be instrumented.
 - **Names in stack logs** are mapped to declarations by `stacklog.EnclosingFns`, which `parse` uses too. Closures and `go`/`defer` wrappers (`pkg.F.func1.2`, `pkg.F.gowrap1`) mean the function that contains them, and method values (`pkg.T.M-fm`) mean the method. A closure in an inlined function is named after both functions (`pkg.(*T).Run.helper.func5`), and both are checked (`pkg.helper` and `pkg.(*T).Run`). That's guessed from the name, so it can't recover an inlined function from another package, and a value-receiver method inlined into a function is misread. The comment on `EnclosingFns` describes an exact alternative using the frames' file:line.
-- **What is matched:** string values and `[]byte`/byte array contents. A value matches if it contains the *full* match string anywhere, so `-match needle` reports `"xneedlex"`. The output shows both the match string and the whole value that contained it. A value that contains several match strings gives one line per string. Strings are loaded up to 64 KiB and arrays up to 4096 elements.
+- **What is matched:** string values and `[]byte`/byte array contents. A value matches if it contains the *full* match string anywhere, so `-match needle` reports `"xneedlex"`. The output shows both the match string (`needle`) and the whole value that contained it (`haystack`). A value that contains several match strings gives one row per string. Strings are loaded up to 64 KiB and arrays up to 4096 elements.
 - **First build is slow:** it recompiles the standard library unoptimized, about 6 s here. The cache is keyed on the settings, the wrapper binary and the helper's sources, so later builds are fast.
 - **Limitations:**
   - If the program's version of a shared module is too old for delve to compile against, the build fails.
@@ -108,9 +138,9 @@ docker run --rm -v /tmp/argmatch-out:/argmatch-out prometheus-argmatch:v3.2.1
 
 The base image runs Prometheus as `nobody`, so the host directory must be writable by that user (e.g. `chmod 777 /tmp/argmatch-out`).
 
-The Dockerfile copies `stacklog` too, at the same path relative to argmatch as here. To use a stack log, put it in the Prometheus source directory and pass `--build-arg ARGMATCH_STACKLOG=/src/<file>`, the same way as a match file (below). Add `--build-arg ARGMATCH_FUNC=` to check only the log's functions.
+The Dockerfile copies `stacklog` too, at the same path relative to argmatch as here. To use a stack log, put it in the Prometheus source directory and pass `--build-arg ARGMATCH_STACKLOG=/src/<file>`. Like a match file (below), it's read during `docker build`, not when the container runs. Add `--build-arg ARGMATCH_FUNC=` to check only the log's functions.
 
-To use a match file, put it in the Prometheus source directory, which is copied to `/src` in the build stage, and pass its path in the container. `ARGMATCH_MATCH` defaults to the config path, so set it to empty to use only the file:
+To use a match file, put it in the Prometheus source directory, which is copied to `/src` in the build stage, and pass its path there, e.g. `/src/argmatch-matches.txt`. The file is read while Prometheus is compiled, during `docker build`, so the image you run doesn't contain it; rebuild after editing it. `ARGMATCH_MATCH` defaults to the config path, so set it to empty to use only the file:
 
 ```sh
 cp matches.txt ~/projects/config_tracing/prometheus/argmatch-matches.txt

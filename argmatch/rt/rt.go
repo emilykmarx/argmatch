@@ -6,12 +6,14 @@ package rt
 
 import (
 	"bytes"
+	"encoding/csv"
 	"fmt"
 	"go/constant"
 	"io"
 	"os"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"unsafe"
@@ -29,15 +31,18 @@ var (
 
 	outOnce sync.Once
 	out     io.Writer = os.Stderr
+	csvOut  *csv.Writer
 
 	mu    sync.Mutex
 	owner int64 // goroutine ID holding mu, to detect re-entry
 )
 
 // Check reports every string in args that contains one of needles, along
-// with the named types and interfaces on the path down to it. names[i] is the
-// source name of the parameter whose address is boxed in args[i]. Output
-// is appended to the file outPath, or written to stderr if outPath is "".
+// with the named types, interfaces and closures on the path down to it, as
+// CSV rows (see csvHeader). names[i] is the source name of the parameter
+// whose address is boxed in args[i]. Output is appended to the file
+// outPath, or written to stderr if outPath is "". Errors always go to
+// stderr.
 //
 // The push linkname lets the injected bodyless declaration in the target
 // package (which can't import rt) refer to this function.
@@ -58,19 +63,29 @@ func Check(needles []string, depth int, outPath string, fn string, names []strin
 	defer func() { owner = 0; mu.Unlock() }()
 
 	outOnce.Do(func() {
-		if outPath == "" {
-			return
+		header := true
+		if outPath != "" {
+			f, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "argmatch: %v; writing to stderr instead\n", err)
+			} else {
+				out = f
+				// Appending to earlier output: it has a header already.
+				if fi, err := f.Stat(); err == nil && fi.Size() > 0 {
+					header = false
+				}
+			}
 		}
-		f, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "argmatch: %v; writing to stderr instead\n", err)
-			return
+		csvOut = csv.NewWriter(out)
+		if header {
+			csvOut.Write(csvHeader)
+			csvOut.Flush()
 		}
-		out = f
 	})
+	defer csvOut.Flush()
 	initOnce.Do(load)
 	if initErr != nil {
-		fmt.Fprintf(out, "argmatch: %v\n", initErr)
+		fmt.Fprintf(os.Stderr, "argmatch: %v\n", initErr)
 		return
 	}
 	scope := &proc.EvalScope{BinInfo: bi, Mem: selfMem}
@@ -89,7 +104,7 @@ func Check(needles []string, depth int, outPath string, fn string, names []strin
 		shallow.MaxVariableRecurse = -1
 		box, err := scope.EvalExpression(expr, shallow)
 		if err != nil || len(box.Children) != 1 {
-			fmt.Fprintf(out, "argmatch: %s: cannot load %s: %v\n", fn, names[i], err)
+			fmt.Fprintf(os.Stderr, "argmatch: %s: cannot load %s: %v\n", fn, names[i], err)
 			continue
 		}
 		// Delve doesn't count dereferencing *T as a level unless T is a
@@ -103,15 +118,29 @@ func Check(needles []string, depth int, outPath string, fn string, names []strin
 		}
 		box, err = scope.EvalExpression(expr, argCfg)
 		if err != nil || len(box.Children) != 1 || len(box.Children[0].Children) != 1 {
-			fmt.Fprintf(out, "argmatch: %s: cannot load %s: %v\n", fn, names[i], err)
+			fmt.Fprintf(os.Stderr, "argmatch: %s: cannot load %s: %v\n", fn, names[i], err)
 			continue
 		}
 		arg := &box.Children[0].Children[0]
 		walk(arg, names[i], nil, func(path []string, expr, needle, val string) {
-			fmt.Fprintf(out, "argmatch: value %q contains %q in %s: %s (%s)\n", val, needle, fn, strings.Join(path, " -> "), expr)
+			closure := false
+			for _, step := range path {
+				closure = closure || strings.HasPrefix(step, closurePrefix)
+			}
+			csvOut.Write(append([]string{needle, val, fn, expr, strconv.FormatBool(closure)}, path...))
 		}, needles)
 	}
 }
+
+// csvHeader names the columns of the output. Each row has one more column
+// per step of the path from the argument down to the match: a named type, an
+// interface ("concrete (implements interface)"), or a closure ("closure fn").
+// Rows have different lengths, so the last header names the first of them.
+var csvHeader = []string{"needle", "haystack", "function", "expression", "closure", "types"}
+
+// closurePrefix starts the path step for a closure; no type name starts
+// with it.
+const closurePrefix = "closure "
 
 // walk calls report for each string or []byte in v's tree and each of
 // needles it contains, if any named type or interface lies on the path to
@@ -126,7 +155,7 @@ func walk(v *proc.Variable, expr string, path []string, report func(path []strin
 		// Report the interface together with its dynamic type, then
 		// continue below the dynamic value so it isn't reported twice.
 		data := &v.Children[0]
-		path = append(path, fmt.Sprintf("%s (concrete %s)", typ, data.DwarfType.String()))
+		path = append(path, fmt.Sprintf("%s (implements %s)", data.DwarfType.String(), typ))
 		walkValue(data, expr, path, report, needles)
 		return
 	case isNamed(typ):
@@ -147,10 +176,26 @@ func walkValue(v *proc.Variable, expr string, path []string, report func(path []
 			}
 		}
 	}
+	if v.Kind == reflect.Func && len(v.Children) > 0 {
+		// A closure (or method value), whose children are the variables
+		// it captured. Name it on the path, so that matches reached
+		// through it are clearly marked.
+		fn := ""
+		if v.Value != nil {
+			fn = constant.StringVal(v.Value)
+		}
+		path = append(path, closurePrefix+fn)
+	}
 	for i := range v.Children {
 		c := &v.Children[i]
 		var cexpr string
 		switch v.Kind {
+		case reflect.Func:
+			name := c.Name
+			if name == ".this" {
+				name = "receiver" // of a method value
+			}
+			cexpr = fmt.Sprintf("%s[captured %s]", expr, name)
 		case reflect.Struct:
 			cexpr = expr + "." + c.Name
 		case reflect.Ptr, reflect.Interface:

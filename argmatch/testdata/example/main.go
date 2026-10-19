@@ -55,6 +55,21 @@ func (id_recvr ID) F(id_arg ID2, h Hier, arr []string,
 	conn.Write([]byte(id_recvr))
 }
 
+type Handler struct{ Path ID }
+
+func (h *Handler) Apply() error { return nil }
+
+type Reloader struct {
+	Name string
+	Fn   func() error
+}
+
+// Matches through closures => the closure and what it captured
+// Method value in a named struct
+// Closure capturing a named struct
+// Closure capturing a basic string
+func G(r Reloader, named func(), basic func()) {}
+
 func main() {
 	needle := "needle"
 	id := ID(needle)
@@ -63,5 +78,7 @@ func main() {
 	out := Outer{P: &in}
 	hier := Hier{needle: 5}
 	id.F(ID2(needle), hier, []string{needle}, named, &out, ID5(needle))
+	h := &Handler{Path: ID(needle)}
+	G(Reloader{Name: "r", Fn: h.Apply}, func() { _ = named }, func() { _ = needle })
 	fmt.Println("done")
 }

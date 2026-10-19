@@ -56,7 +56,7 @@ var (
 	funcName  = flag.String("func", os.Getenv("ARGMATCH_FUNC"), "function to check, as named by delve (env ARGMATCH_FUNC)")
 	stackLog  = flag.String("stacklog", os.Getenv("ARGMATCH_STACKLOG"), "absolute path of a log of connection stacktraces; every function in the stacks is checked, except those stacklog.IgnoreFn ignores (env ARGMATCH_STACKLOG)")
 	needle    = flag.String("match", os.Getenv("ARGMATCH_MATCH"), "string to look for (env ARGMATCH_MATCH)")
-	matchFile = flag.String("matchfile", os.Getenv("ARGMATCH_MATCHFILE"), "absolute path of a file of strings to look for, one per line, in addition to -match; blank lines are ignored (env ARGMATCH_MATCHFILE)")
+	matchFile = flag.String("matchfile", os.Getenv("ARGMATCH_MATCHFILE"), "absolute path of a file of strings to look for, one per line, in addition to -match; blank lines and lines starting with # are ignored (env ARGMATCH_MATCHFILE)")
 	depth     = flag.Int("depth", envInt("ARGMATCH_DEPTH", 5), "how many levels of nested structs, arrays, maps and pointers-to-pointers to load (delve's MaxVariableRecurse; env ARGMATCH_DEPTH)")
 	outPath   = flag.String("out", os.Getenv("ARGMATCH_OUT"), "file the program appends its matches to, resolved against the program's working directory (default: stderr; env ARGMATCH_OUT)")
 	rtDir     = flag.String("rtdir", os.Getenv("ARGMATCH_RTDIR"), "directory of the argmatch module (default: the directory containing this executable; env ARGMATCH_RTDIR)")
@@ -139,8 +139,9 @@ func loadFuncs() {
 	}
 }
 
-// loadNeedles returns -match and the non-blank lines of -matchfile, without
-// duplicates. Each line is used as is, apart from a trailing \r.
+// loadNeedles returns -match and the lines of -matchfile that are neither
+// blank nor comments (starting with #), without duplicates. Each line is
+// used as is, apart from a trailing \r.
 func loadNeedles() []string {
 	var ns []string
 	if *needle != "" {
@@ -156,7 +157,8 @@ func loadNeedles() []string {
 		data, err := os.ReadFile(*matchFile)
 		check(err)
 		for _, line := range strings.Split(string(data), "\n") {
-			if line = strings.TrimSuffix(line, "\r"); line != "" && !slices.Contains(ns, line) {
+			line = strings.TrimSuffix(line, "\r")
+			if line != "" && !strings.HasPrefix(line, "#") && !slices.Contains(ns, line) {
 				ns = append(ns, line)
 			}
 		}

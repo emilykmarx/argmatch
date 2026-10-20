@@ -42,6 +42,8 @@ Parsing a large log takes about a second, and the go command runs the wrapper on
 
 The wrapper path must be absolute, which is why it's set from `$PWD`. Matches are printed while the program runs, not during the build. By default they go to stderr. With `-out file` (env `ARGMATCH_OUT`) the program appends them to that file instead, so they can't be interleaved with the program's own stderr output. A relative path is resolved against the program's working directory when it runs, and if the file can't be opened, output falls back to stderr. `-depth` defaults to 5, so you can leave it off.
 
+With `-recvonly` (env `ARGMATCH_RECVONLY=1`), only method receivers are checked, not parameters. Functions without a receiver are then skipped, including any named with `-func` or found in `-stacklog`.
+
 Matches are written as CSV, one row per match, with these columns:
 
 | Column | Contents |
@@ -142,7 +144,7 @@ docker run --rm -v /tmp/argmatch-out:/argmatch-out prometheus-argmatch:v3.2.1
 
 The base image runs Prometheus as `nobody`, so the host directory must be writable by that user (e.g. `chmod 777 /tmp/argmatch-out`).
 
-The Dockerfile copies `stacklog` too, at the same path relative to argmatch as here. To use a stack log, put it in the Prometheus source directory and pass `--build-arg ARGMATCH_STACKLOG=/src/<file>`. Like a match file (below), it's read during `docker build`, not when the container runs. Add `--build-arg ARGMATCH_FUNC=` to check only the log's functions.
+The Dockerfile copies `stacklog` too, at the same path relative to argmatch as here. To use a stack log, put it in the Prometheus source directory and pass `--build-arg ARGMATCH_STACKLOG=/src/<file>`. Like a match file (below), it's read during `docker build`, not when the container runs. Add `--build-arg ARGMATCH_FUNC=` to check only the log's functions, and `--build-arg ARGMATCH_RECVONLY=1` to check only their receivers.
 
 To use a match file, put it in the Prometheus source directory, which is copied to `/src` in the build stage, and pass its path there, e.g. `/src/argmatch-matches.txt`. The file is read while Prometheus is compiled, during `docker build`, so the image you run doesn't contain it; rebuild after editing it. `ARGMATCH_MATCH` defaults to the config path, so set it to empty to use only the file:
 

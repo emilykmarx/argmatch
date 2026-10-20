@@ -30,6 +30,16 @@ func TestExample(t *testing.T) {
 	}
 }
 
+// TestRecvOnly checks that -recvonly checks the receiver but not the
+// parameters.
+func TestRecvOnly(t *testing.T) {
+	got := runExample(t, "-func", "main.ID.F", "-match", "needle", "-recvonly")
+	want := header + "needle,needle,main.ID.F,id_recvr,false,main.ID\n"
+	if got != want {
+		t.Errorf("matches:\n%s\nwant:\n%s", got, want)
+	}
+}
+
 // TestClosure checks that matches reached through a func value's captured
 // variables are marked with the closure and the captured variable.
 func TestClosure(t *testing.T) {

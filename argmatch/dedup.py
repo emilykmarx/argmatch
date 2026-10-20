@@ -49,6 +49,36 @@ def normalize(row):
     return row
 
 
+# A haystack can be any bytes argmatch found a match in, e.g. a binary buffer
+# (CSVs written before argmatch escaped haystacks have them raw), so CSVs are
+# read and written as bytes: invalid UTF-8 is kept as is (surrogateescape),
+# and NUL bytes, which Python's csv module (before 3.11) rejects, are hidden
+# behind a character the data doesn't contain while the csv module runs.
+
+
+def _unused_char(text):
+    return next(chr(c) for c in range(0xE000, 0xF900) if chr(c) not in text)
+
+
+def read_csv(data):
+    """Return the rows of CSV data (bytes)."""
+    text = data.decode("utf-8", "surrogateescape")
+    nul = _unused_char(text)
+    rows = csv.reader(io.StringIO(text.replace("\0", nul), newline=""))
+    return [[field.replace(nul, "\0") for field in row] for row in rows]
+
+
+def write_csv(rows, out):
+    """Write rows as CSV to the binary file out."""
+    nul = _unused_char("".join(field for row in rows for field in row))
+    buf = io.StringIO(newline="")
+    csv.writer(buf, lineterminator="\n").writerows(
+        [field.replace("\0", nul) for field in row] for row in rows
+    )
+    text = buf.getvalue().replace(nul, "\0")
+    out.write(text.encode("utf-8", "surrogateescape"))
+
+
 def main():
     if len(sys.argv) > 2:
         sys.exit(USAGE)
@@ -57,19 +87,10 @@ def main():
             data = f.read()
     else:
         data = sys.stdin.buffer.read()
-    # A haystack can be any bytes argmatch found a match in, e.g. a binary
-    # buffer, so keep invalid UTF-8 as is (surrogateescape) and hide NUL
-    # bytes, which Python's csv module (before 3.11) rejects, behind a
-    # character the input doesn't contain.
-    text = data.decode("utf-8", "surrogateescape")
-    nul = next(chr(c) for c in range(0xE000, 0xF900) if chr(c) not in text)
-    rows = csv.reader(io.StringIO(text.replace("\0", nul), newline=""))
-    buf = io.StringIO(newline="")
-    out = csv.writer(buf, lineterminator="\n")
+    rows = iter(read_csv(data))
     header = next(rows, None)
     if header is None:
         return
-    out.writerow(header)
     seen = set()
     unique = []
     for row in rows:
@@ -83,8 +104,7 @@ def main():
         haystacks.setdefault(row[NEEDLE], set()).add(row[HAYSTACK])
     # sort is stable, so ties keep their first-appearance order.
     unique.sort(key=lambda row: (len(haystacks[row[NEEDLE]]), row[NEEDLE], row[HAYSTACK]))
-    out.writerows(unique)
-    sys.stdout.buffer.write(buf.getvalue().replace(nul, "\0").encode("utf-8", "surrogateescape"))
+    write_csv([header] + unique, sys.stdout.buffer)
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ const header = "needle,haystack,function,expression,closure,types\n"
 // wantF is the output for F with -match needle.
 const wantF = header + `needle,needle,main.ID.F,id_recvr,false,main.ID
 needle,needle,main.ID.F,id_arg,false,main.ID2
-needle,needle,main.ID.F,h<key 0>,false,main.Hier
+needle,needle,main.ID.F,"h<key ""needle"">",false,main.Hier
 needle,needle,main.ID.F,in.Name,false,main.Named,main.ID3
 needle,needle,main.ID.F,o.P.Name,false,main.Outer,main.Inner,main.ID4
 needle,needle,main.ID.F,i,false,main.ID5 (implements main.Iface)
@@ -73,7 +73,7 @@ func TestMatchFile(t *testing.T) {
 	for _, m := range []string{
 		`id_recvr,false,main.ID`,
 		`id_arg,false,main.ID2`,
-		`h<key 0>,false,main.Hier`,
+		`"h<key ""needle"">",false,main.Hier`,
 		`in.Name,false,main.Named,main.ID3`,
 		`o.P.Name,false,main.Outer,main.Inner,main.ID4`,
 		`i,false,main.ID5 (implements main.Iface)`,

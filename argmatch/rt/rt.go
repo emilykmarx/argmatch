@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode/utf8"
 	"unsafe"
 
 	"github.com/go-delve/delve/pkg/dwarf/godwarf"
@@ -127,7 +128,7 @@ func Check(needles []string, depth int, outPath string, fn string, names []strin
 			for _, step := range path {
 				closure = closure || strings.HasPrefix(step, closurePrefix)
 			}
-			csvOut.Write(append([]string{needle, val, fn, expr, strconv.FormatBool(closure)}, path...))
+			csvOut.Write(append([]string{needle, escape(val), fn, expr, strconv.FormatBool(closure)}, path...))
 		}, needles)
 	}
 }
@@ -141,6 +142,28 @@ var csvHeader = []string{"needle", "haystack", "function", "expression", "closur
 // closurePrefix starts the path step for a closure; no type name starts
 // with it.
 const closurePrefix = "closure "
+
+// escape returns s with non-printable characters, invalid UTF-8 and
+// backslashes escaped as in a Go string literal (e.g. \x00, \n, \\), so
+// that a haystack from a binary buffer stays readable text. Printable
+// characters, including non-ASCII ones and quotes, are left as is.
+func escape(s string) string {
+	var b strings.Builder
+	for len(s) > 0 {
+		r, size := utf8.DecodeRuneInString(s)
+		switch {
+		case r == '"':
+			b.WriteByte('"') // CSV quoting takes care of it
+		case r == utf8.RuneError && size == 1, r == '\\', !strconv.IsPrint(r):
+			q := strconv.Quote(s[:size])
+			b.WriteString(q[1 : len(q)-1])
+		default:
+			b.WriteString(s[:size])
+		}
+		s = s[size:]
+	}
+	return b.String()
+}
 
 // walk calls report for each string or []byte in v's tree and each of
 // needles it contains, if any named type or interface lies on the path to
@@ -201,9 +224,18 @@ func walkValue(v *proc.Variable, expr string, path []string, report func(path []
 		case reflect.Ptr, reflect.Interface:
 			cexpr = expr
 		case reflect.Map:
-			if i%2 == 0 {
+			// Children alternate key, value. Name an entry by its key if
+			// it's a basic value; otherwise by its position, which depends
+			// on the map's random hash seed and so differs between runs.
+			key, ok := keyLiteral(&v.Children[i&^1])
+			switch {
+			case i%2 == 0 && ok:
+				cexpr = fmt.Sprintf("%s<key %s>", expr, key)
+			case i%2 == 0:
 				cexpr = fmt.Sprintf("%s<key %d>", expr, i/2)
-			} else {
+			case ok:
+				cexpr = fmt.Sprintf("%s[%s]", expr, key)
+			default:
 				cexpr = fmt.Sprintf("%s[<key %d>]", expr, i/2)
 			}
 		default:
@@ -211,6 +243,27 @@ func walkValue(v *proc.Variable, expr string, path []string, report func(path []
 		}
 		walk(c, cexpr, path, report, needles)
 	}
+}
+
+// keyLiteral returns a map key as a Go literal, e.g. "config.file" or 42,
+// if it's a fully loaded string, integer or bool.
+func keyLiteral(k *proc.Variable) (string, bool) {
+	if k.Unreadable != nil || k.Value == nil {
+		return "", false
+	}
+	switch k.Kind {
+	case reflect.String:
+		s := constant.StringVal(k.Value)
+		if int64(len(s)) != k.Len {
+			return "", false // truncated
+		}
+		return strconv.Quote(s), true
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Bool:
+		return k.Value.ExactString(), true
+	}
+	return "", false
 }
 
 // stringValue returns the contents of a string, or of a byte slice or

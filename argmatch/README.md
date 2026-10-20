@@ -47,7 +47,7 @@ Matches are written as CSV, one row per match, with these columns:
 | Column | Contents |
 |---|---|
 | `needle` | the match string |
-| `haystack` | the whole value that contained it |
+| `haystack` | the whole value that contained it, with non-printable characters, invalid UTF-8 and backslashes escaped as in a Go string literal (`\x00`, `\n`, `\\`), since it can be a binary buffer |
 | `function` | the instrumented function |
 | `expression` | the path from the parameter to the value, e.g. `o.P.Name` |
 | `closure` | `true` if a closure is on the path, else `false` |
@@ -58,6 +58,10 @@ A step of the path is one of:
 - an interface, written with its concrete type first, e.g. `main.ID5 (implements main.Iface)`;
 - a closure or method value, written `closure <function>`, e.g. `closure main.(*Handler).Apply-fm`.
 
+In expressions, a map entry is named by its key when the key is a string, integer or bool: `m["config.file"]` for the value and `m<key "config.file">` for the key itself. Other keys (e.g. structs) are named by their position, `m[<key 0>]`. Positions come from the map's memory layout, which depends on a hash seed Go randomizes for each map, so they can differ between runs. Expressions containing quotes are quoted in the CSV, with the inner quotes doubled, e.g. `"h<key ""needle"">"`.
+
+Each call of an instrumented function writes its own rows, so a function called often repeats the same rows. [dedup.py](dedup.py) removes the duplicates from one run's CSV: `./dedup.py matches.csv > deduped.csv` (or read from stdin). It also merges rows that differ only in a map position, writing it as `<key N>`, and sorts the rows by needle, then haystack.
+
 Rows have as many step columns as their path has steps, so rows differ in length. The header names only the first step column (`types`). The header is written when the output starts: once at the top of stderr, or when the `-out` file is new or empty, so appending to earlier output doesn't repeat it. Errors, such as an argument that can't be loaded, always go to stderr as plain text, never into the CSV.
 
 Output for `F` in `testdata/example/main.go`:
@@ -66,7 +70,7 @@ Output for `F` in `testdata/example/main.go`:
 needle,haystack,function,expression,closure,types
 needle,needle,main.ID.F,id_recvr,false,main.ID
 needle,needle,main.ID.F,id_arg,false,main.ID2
-needle,needle,main.ID.F,h<key 0>,false,main.Hier
+needle,needle,main.ID.F,"h<key ""needle"">",false,main.Hier
 needle,needle,main.ID.F,in.Name,false,main.Named,main.ID3
 needle,needle,main.ID.F,o.P.Name,false,main.Outer,main.Inner,main.ID4
 needle,needle,main.ID.F,i,false,main.ID5 (implements main.Iface)
@@ -100,7 +104,7 @@ The program is never stopped or attached to. All instrumentation happens at comp
 Also tested by hand:
 
 - **Standard library:** `-func 'net.(*sysDialer).dialSerial' -match 127.0.0.1` reports `127.0.0.1:<port>` at `sd.address` with type `net.sysDialer`. That's a package delve itself depends on.
-- **Stack log from prombench:** Prometheus built with `-stacklog` set to a prometheus-meta pod log (92k connections, 252 distinct functions) builds in 25 s. Running it with `-match prometheus.yml` reports matches in `main.reloadConfig`, `web.(*Handler).Run`, `route.(*Router).handle` and the promhttp handlers. Nearly all of them (377 of 384 distinct rows) are through closures, e.g. expression `rls[2].reloader[captured receiver].flagsMap[<key 3>]` with steps `main.reloader`, `closure github.com/prometheus/prometheus/web.(*Handler).ApplyConfig-fm`, `github.com/prometheus/prometheus/web.Handler`.
+- **Stack log from prombench:** Prometheus built with `-stacklog` set to a prometheus-meta pod log (92k connections, 252 distinct functions) builds in 25 s. Running it with `-match prometheus.yml` reports matches in `main.reloadConfig`, `web.(*Handler).Run`, `route.(*Router).handle` and the promhttp handlers. Nearly all of them (377 of 384 distinct rows) are through closures, e.g. expression `rls[2].reloader[captured receiver].flagsMap["config.file"]` with steps `main.reloader`, `closure github.com/prometheus/prometheus/web.(*Handler).ApplyConfig-fm`, `github.com/prometheus/prometheus/web.Handler`.
 - **Edge cases:** unnamed and `_` parameters, a generic receiver (`main.G[main.Name]`), `any` holding a plain string, and two goroutines calling the function at the same time all work. The depth limit cuts off deeper struct nesting as expected.
 - **Byte slices:** `[]byte` and byte arrays are matched like strings. A plain `[]byte` argument prints nothing, but a named `type B []byte`, a `[]byte` field in a named struct, and a `[]byte` in an `any` are reported.
 

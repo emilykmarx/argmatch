@@ -6,8 +6,12 @@ Usage: dedup.py [input.csv] > output.csv
 Reads the CSV argmatch wrote (from the file, or stdin if none is given) and
 writes it to stdout with duplicate rows removed, keeping the header. Rows are
 compared whole, except that map positions in the expression column are
-ignored (see below). The output is sorted by needle, then haystack; rows with
-the same needle and haystack stay in the order in which they first appear.
+ignored (see below).
+
+The output is grouped by needle, and the groups are ordered by how many
+distinct haystacks the needle matched, fewest first (ties by needle). Within a
+group, rows are sorted by haystack; rows with the same needle and haystack stay
+in the order in which they first appear.
 """
 
 import csv
@@ -74,8 +78,11 @@ def main():
         if key not in seen:
             seen.add(key)
             unique.append(row)
+    haystacks = {}  # needle -> its distinct haystacks
+    for row in unique:
+        haystacks.setdefault(row[NEEDLE], set()).add(row[HAYSTACK])
     # sort is stable, so ties keep their first-appearance order.
-    unique.sort(key=lambda row: (row[NEEDLE], row[HAYSTACK]))
+    unique.sort(key=lambda row: (len(haystacks[row[NEEDLE]]), row[NEEDLE], row[HAYSTACK]))
     out.writerows(unique)
     sys.stdout.buffer.write(buf.getvalue().replace(nul, "\0").encode("utf-8", "surrogateescape"))
 

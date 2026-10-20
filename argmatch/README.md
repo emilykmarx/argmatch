@@ -60,7 +60,7 @@ A step of the path is one of:
 
 In expressions, a map entry is named by its key when the key is a string, integer or bool: `m["config.file"]` for the value and `m<key "config.file">` for the key itself. Other keys (e.g. structs) are named by their position, `m[<key 0>]`. Positions come from the map's memory layout, which depends on a hash seed Go randomizes for each map, so they can differ between runs. Expressions containing quotes are quoted in the CSV, with the inner quotes doubled, e.g. `"h<key ""needle"">"`.
 
-Each call of an instrumented function writes its own rows, so a function called often repeats the same rows. [dedup.py](dedup.py) removes the duplicates from one run's CSV: `./dedup.py matches.csv > deduped.csv` (or read from stdin). It also merges rows that differ only in a map position, writing it as `<key N>`, and sorts the rows by needle, then haystack.
+Each call of an instrumented function writes its own rows, so a function called often repeats the same rows. [dedup.py](dedup.py) removes the duplicates from one run's CSV: `./dedup.py matches.csv > deduped.csv` (or read from stdin). It also merges rows that differ only in a map position, writing it as `<key N>`, and groups the rows by needle, ordering the groups by how many distinct haystacks the needle matched (fewest first) and sorting each group by haystack.
 
 Rows have as many step columns as their path has steps, so rows differ in length. The header names only the first step column (`types`). The header is written when the output starts: once at the top of stderr, or when the `-out` file is new or empty, so appending to earlier output doesn't repeat it. Errors, such as an argument that can't be loaded, always go to stderr as plain text, never into the CSV.
 

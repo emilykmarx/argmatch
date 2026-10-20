@@ -1,3 +1,6 @@
 # Built executables
 /example
 /argmatch/argmatch
+
+# Python bytecode (needle_types.py imports dedup.py)
+__pycache__/

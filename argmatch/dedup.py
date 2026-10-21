@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deduplicate the CSV output of one argmatch run.
+"""Deduplicate and group/sort the CSV output of one argmatch run.
 
 Usage: dedup.py [input.csv] > output.csv
 
@@ -12,6 +12,11 @@ The output is grouped by needle, and the groups are ordered by how many
 distinct haystacks the needle matched, fewest first (ties by needle). Within a
 group, rows are sorted by haystack; rows with the same needle and haystack stay
 in the order in which they first appear.
+
+Columns are found by name in the header, since argmatch leaves some out: with
+exact matching there's no haystack column (every haystack is its needle, so
+groups are just sorted by needle), and with closures ignored there's no closure
+column.
 """
 
 import csv
@@ -21,8 +26,6 @@ import sys
 
 USAGE = "usage: dedup.py [input.csv] > output.csv"
 
-NEEDLE, HAYSTACK, EXPRESSION = 0, 1, 3  # indexes of columns
-
 # A map entry whose key isn't a string, integer or bool is named by its
 # position in the map, e.g. m[<key 3>] or m<key 3>, not by its key. A string
 # key is a quoted Go literal, e.g. m["<key 3>"]; those are matched too so that
@@ -30,8 +33,9 @@ NEEDLE, HAYSTACK, EXPRESSION = 0, 1, 3  # indexes of columns
 POSITIONAL_KEY = re.compile(r'"(?:[^"\\]|\\.)*"|<key \d+>')
 
 
-def normalize(row):
-    """Return row with map positions in the expression replaced by <key N>.
+def normalize(row, expression):
+    """Return row with map positions in the expression (the column at index
+    expression) replaced by <key N>.
 
     Rows that differ only in a map position are merged. Within one run the
     positions of an unmodified map are the same on every call, but the map may
@@ -40,11 +44,11 @@ def normalize(row):
     different positions, and rows that differ only in the position most likely
     describe the same entry.
     """
-    if len(row) > EXPRESSION:
+    if len(row) > expression:
         row = row[:]
-        row[EXPRESSION] = POSITIONAL_KEY.sub(
+        row[expression] = POSITIONAL_KEY.sub(
             lambda m: m.group() if m.group().startswith('"') else "<key N>",
-            row[EXPRESSION],
+            row[expression],
         )
     return row
 
@@ -91,19 +95,22 @@ def main():
     header = next(rows, None)
     if header is None:
         return
+    needle, expression = header.index("needle"), header.index("expression")
+    # Without a haystack column, every haystack is its needle.
+    haystack = header.index("haystack") if "haystack" in header else needle
     seen = set()
     unique = []
     for row in rows:
-        row = normalize(row)
+        row = normalize(row, expression)
         key = tuple(row)
         if key not in seen:
             seen.add(key)
             unique.append(row)
     haystacks = {}  # needle -> its distinct haystacks
     for row in unique:
-        haystacks.setdefault(row[NEEDLE], set()).add(row[HAYSTACK])
+        haystacks.setdefault(row[needle], set()).add(row[haystack])
     # sort is stable, so ties keep their first-appearance order.
-    unique.sort(key=lambda row: (len(haystacks[row[NEEDLE]]), row[NEEDLE], row[HAYSTACK]))
+    unique.sort(key=lambda row: (len(haystacks[row[needle]]), row[needle], row[haystack]))
     write_csv([header] + unique, sys.stdout.buffer)
 
 

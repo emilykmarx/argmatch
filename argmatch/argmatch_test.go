@@ -10,15 +10,17 @@ import (
 	"testing"
 )
 
-const header = "needle,haystack,function,expression,closure,types\n"
+// header is the output's header with the default -exact and
+// -ignoreclosures, which leave out the haystack and closure columns.
+const header = "needle,function,expression,types\n"
 
 // wantF is the output for F with -match needle.
-const wantF = header + `needle,needle,main.ID.F,id_recvr,false,main.ID
-needle,needle,main.ID.F,id_arg,false,main.ID2
-needle,needle,main.ID.F,"h<key ""needle"">",false,main.Hier
-needle,needle,main.ID.F,in.Name,false,main.Named,main.ID3
-needle,needle,main.ID.F,o.P.Name,false,main.Outer,main.Inner,main.ID4
-needle,needle,main.ID.F,i,false,main.ID5 (implements main.Iface)
+const wantF = header + `needle,main.ID.F,id_recvr,main.ID
+needle,main.ID.F,id_arg,main.ID2
+needle,main.ID.F,"h<key ""needle"">",main.Hier
+needle,main.ID.F,in.Name,main.Named,main.ID3
+needle,main.ID.F,o.P.Name,main.Outer,main.Inner,main.ID4
+needle,main.ID.F,i,main.ID5 (implements main.Iface)
 `
 
 // TestExample builds testdata/example under argmatch with -match, runs it,
@@ -34,17 +36,28 @@ func TestExample(t *testing.T) {
 // parameters.
 func TestRecvOnly(t *testing.T) {
 	got := runExample(t, "-func", "main.ID.F", "-match", "needle", "-recvonly")
-	want := header + "needle,needle,main.ID.F,id_recvr,false,main.ID\n"
+	want := header + "needle,main.ID.F,id_recvr,main.ID\n"
 	if got != want {
 		t.Errorf("matches:\n%s\nwant:\n%s", got, want)
 	}
 }
 
-// TestClosure checks that matches reached through a func value's captured
-// variables are marked with the closure and the captured variable.
+// TestIgnoreClosuresDefault checks that by default the variables captured
+// by func values aren't checked: G's only matches are through closures.
+func TestIgnoreClosuresDefault(t *testing.T) {
+	if got := runExample(t, "-func", "main.G", "-match", "needle"); got != header {
+		t.Errorf("matches:\n%s\nwant only the header", got)
+	}
+}
+
+// TestClosure checks that with -ignoreclosures=false, matches reached
+// through a func value's captured variables are reported, marked with the
+// closure and the captured variable. With -exact=false as well, all the
+// columns are written.
 func TestClosure(t *testing.T) {
-	got := runExample(t, "-func", "main.G", "-match", "needle")
-	want := header + `needle,needle,main.G,r.Fn[captured receiver].Path,true,main.Reloader,closure main.(*Handler).Apply-fm,main.Handler,main.ID
+	got := runExample(t, "-func", "main.G", "-match", "needle", "-ignoreclosures=false", "-exact=false")
+	want := "needle,haystack,function,expression,closure,types\n" +
+		`needle,needle,main.G,r.Fn[captured receiver].Path,true,main.Reloader,closure main.(*Handler).Apply-fm,main.Handler,main.ID
 needle,needle,main.G,named[captured named].Name,true,closure main.main.func1,main.Named,main.ID3
 needle,needle,main.G,basic[captured needle],true,closure main.main.func2
 `
@@ -68,8 +81,17 @@ func TestStackLog(t *testing.T) {
 	}
 }
 
+// TestExactDefault checks that by default a value must equal the match
+// string: "eedl" is in "needle" but isn't reported.
+func TestExactDefault(t *testing.T) {
+	if got := runExample(t, "-func", "main.ID.F", "-match", "eedl"); got != header {
+		t.Errorf("matches:\n%s\nwant only the header", got)
+	}
+}
+
 // TestMatchFile checks that every value is checked against every string in
-// -matchfile, and that each match names the string it matched.
+// -matchfile, and that each match names the string it matched. It uses
+// -exact=false, so that partial matches are reported too.
 func TestMatchFile(t *testing.T) {
 	matches := filepath.Join(t.TempDir(), "matches.txt")
 	// A partial match, the whole value, a string that never matches, and a
@@ -77,16 +99,16 @@ func TestMatchFile(t *testing.T) {
 	if err := os.WriteFile(matches, []byte("# comment\needl\nneedle\n\nnot present\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	got := runExample(t, "-func", "main.ID.F", "-matchfile", `"`+matches+`"`)
+	got := runExample(t, "-func", "main.ID.F", "-matchfile", `"`+matches+`"`, "-exact=false")
 	var want strings.Builder
-	want.WriteString(header)
+	want.WriteString("needle,haystack,function,expression,types\n")
 	for _, m := range []string{
-		`id_recvr,false,main.ID`,
-		`id_arg,false,main.ID2`,
-		`"h<key ""needle"">",false,main.Hier`,
-		`in.Name,false,main.Named,main.ID3`,
-		`o.P.Name,false,main.Outer,main.Inner,main.ID4`,
-		`i,false,main.ID5 (implements main.Iface)`,
+		`id_recvr,main.ID`,
+		`id_arg,main.ID2`,
+		`"h<key ""needle"">",main.Hier`,
+		`in.Name,main.Named,main.ID3`,
+		`o.P.Name,main.Outer,main.Inner,main.ID4`,
+		`i,main.ID5 (implements main.Iface)`,
 	} {
 		want.WriteString("eedl,needle,main.ID.F," + m + "\n")
 		want.WriteString("needle,needle,main.ID.F," + m + "\n")

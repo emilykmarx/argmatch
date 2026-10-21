@@ -25,7 +25,8 @@ To check against several strings, put them in a file, one per line, and pass it 
 
 ```sh
 printf 'needle\needl\n' > /tmp/matches.txt
-(cd testdata/example && go build -toolexec "$A -func main.ID.F -matchfile /tmp/matches.txt" -o /tmp/example .) && /tmp/example
+# -exact=false so that "needl" matches "needle" too
+(cd testdata/example && go build -toolexec "$A -func main.ID.F -matchfile /tmp/matches.txt -exact=false" -o /tmp/example .) && /tmp/example
 ```
 
 To check every function that appears in a log of connection stacktraces, pass the log with `-stacklog` (env `ARGMATCH_STACKLOG`), instead of or as well as `-func`. Like `-matchfile`, the path must be absolute and the log is read at build time. The log is parsed with `stacklog`, the parser shared with conftamer's `parse` package, from `../../golang.org-x-tools/gopls/conftamer/stacklog`. Functions are chosen the same way `parse` chooses them:
@@ -40,7 +41,9 @@ To check every function that appears in a log of connection stacktraces, pass th
 
 Parsing a large log takes about a second, and the go command runs the wrapper once per package. So the list of functions is cached in `~/.cache/argmatch/`, keyed on the log's path, size and modification time.
 
-The wrapper path must be absolute, which is why it's set from `$PWD`. Matches are printed while the program runs, not during the build. By default they go to stderr. With `-out file` (env `ARGMATCH_OUT`) the program appends them to that file instead, so they can't be interleaved with the program's own stderr output. A relative path is resolved against the program's working directory when it runs, and if the file can't be opened, output falls back to stderr. `-depth` defaults to 5, so you can leave it off.
+The wrapper path must be absolute, which is why it's set from `$PWD`. Matches are printed while the program runs, not during the build. By default they go to stderr. With `-out file` (env `ARGMATCH_OUT`) the program writes them to that file instead, so they can't be interleaved with the program's own stderr output. The file is overwritten when the program first calls an instrumented function, so each run replaces the previous run's output. A run that never calls one leaves the old file alone. Give each process its own `-out` file: two processes writing to the same one (e.g. two copies of the program, or two containers with the same output directory mounted) overwrite each other's output. A relative path is resolved against the program's working directory when it runs, and if the file can't be opened, output falls back to stderr. `-depth` defaults to 5, so you can leave it off.
+
+Matches are exact by default: a value is reported only if it equals a match string. `-exact=false` (env `ARGMATCH_EXACT=false`) also reports values that contain one (see "What is matched" below).
 
 With `-recvonly` (env `ARGMATCH_RECVONLY=1`), only method receivers are checked, not parameters. Functions without a receiver are then skipped, including any named with `-func` or found in `-stacklog`.
 
@@ -49,11 +52,13 @@ Matches are written as CSV, one row per match, with these columns:
 | Column | Contents |
 |---|---|
 | `needle` | the match string |
-| `haystack` | the whole value that contained it, with non-printable characters, invalid UTF-8 and backslashes escaped as in a Go string literal (`\x00`, `\n`, `\\`), since it can be a binary buffer |
+| `haystack` | only with `-exact=false`: the whole value that matched, with non-printable characters, invalid UTF-8 and backslashes escaped as in a Go string literal (`\x00`, `\n`, `\\`), since it can be a binary buffer. With exact matching it would always equal `needle`, so it's left out. |
 | `function` | the instrumented function |
 | `expression` | the path from the parameter to the value, e.g. `o.P.Name` |
-| `closure` | `true` if a closure is on the path, else `false` |
+| `closure` | only with `-ignoreclosures=false`: `true` if a closure is on the path, else `false`. With closures ignored it would always be `false`, so it's left out. |
 | `types` and every column after it | one per step of the path from the parameter down to the match, in order |
+
+So with the defaults the columns are `needle,function,expression,types`, and with `-exact=false -ignoreclosures=false` they're `needle,haystack,function,expression,closure,types`. Scripts reading the output should find columns by name in the header.
 
 A step of the path is one of:
 - a named type, e.g. `main.Outer`;
@@ -62,32 +67,32 @@ A step of the path is one of:
 
 In expressions, a map entry is named by its key when the key is a string, integer or bool: `m["config.file"]` for the value and `m<key "config.file">` for the key itself. Other keys (e.g. structs) are named by their position, `m[<key 0>]`. Positions come from the map's memory layout, which depends on a hash seed Go randomizes for each map, so they can differ between runs. Expressions containing quotes are quoted in the CSV, with the inner quotes doubled, e.g. `"h<key ""needle"">"`.
 
-Each call of an instrumented function writes its own rows, so a function called often repeats the same rows. [dedup.py](dedup.py) removes the duplicates from one run's CSV: `./dedup.py matches.csv > deduped.csv` (or read from stdin). It also merges rows that differ only in a map position, writing it as `<key N>`, and groups the rows by needle, ordering the groups by how many distinct haystacks the needle matched (fewest first) and sorting each group by haystack.
+Each call of an instrumented function writes its own rows, so a function called often repeats the same rows. [dedup.py](dedup.py) removes the duplicates from one run's CSV: `./dedup.py matches.csv > deduped.csv` (or read from stdin). It also merges rows that differ only in a map position, writing it as `<key N>`, and groups the rows by needle, ordering the groups by how many distinct haystacks the needle matched (fewest first) and sorting each group by haystack. Without a `haystack` column (exact matching), that's simply sorting by needle.
 
-Rows have as many step columns as their path has steps, so rows differ in length. The header names only the first step column (`types`). The header is written when the output starts: once at the top of stderr, or when the `-out` file is new or empty, so appending to earlier output doesn't repeat it. Errors, such as an argument that can't be loaded, always go to stderr as plain text, never into the CSV.
+Rows have as many step columns as their path has steps, so rows differ in length. The header names only the first step column (`types`). The header is written once, at the top of the output. Errors, such as an argument that can't be loaded, always go to stderr as plain text, never into the CSV.
 
 Output for `F` in `testdata/example/main.go`:
 
 ```
-needle,haystack,function,expression,closure,types
-needle,needle,main.ID.F,id_recvr,false,main.ID
-needle,needle,main.ID.F,id_arg,false,main.ID2
-needle,needle,main.ID.F,"h<key ""needle"">",false,main.Hier
-needle,needle,main.ID.F,in.Name,false,main.Named,main.ID3
-needle,needle,main.ID.F,o.P.Name,false,main.Outer,main.Inner,main.ID4
-needle,needle,main.ID.F,i,false,main.ID5 (implements main.Iface)
+needle,function,expression,types
+needle,main.ID.F,id_recvr,main.ID
+needle,main.ID.F,id_arg,main.ID2
+needle,main.ID.F,"h<key ""needle"">",main.Hier
+needle,main.ID.F,in.Name,main.Named,main.ID3
+needle,main.ID.F,o.P.Name,main.Outer,main.Inner,main.ID4
+needle,main.ID.F,i,main.ID5 (implements main.Iface)
 done
 ```
 
 `arr []string` correctly gives no output.
 
-A match reached through a func value's captured variables has `closure` set to `true`, and a `closure <function>` step at its place in the path. The expression shows the captured variable as `[captured <variable>]`, with `receiver` for a method value's receiver. For `G` in the example:
+By default, the variables captured by func values (closures and method values) aren't checked, so `G` in the example reports nothing. With `-ignoreclosures=false` (env `ARGMATCH_IGNORECLOSURES=false`) they are. A match reached through them has `closure` set to `true`, and a `closure <function>` step at its place in the path. The expression shows the captured variable as `[captured <variable>]`, with `receiver` for a method value's receiver. For `G` with `-ignoreclosures=false`:
 
 ```
-needle,haystack,function,expression,closure,types
-needle,needle,main.G,r.Fn[captured receiver].Path,true,main.Reloader,closure main.(*Handler).Apply-fm,main.Handler,main.ID
-needle,needle,main.G,named[captured named].Name,true,closure main.main.func1,main.Named,main.ID3
-needle,needle,main.G,basic[captured needle],true,closure main.main.func2
+needle,function,expression,closure,types
+needle,main.G,r.Fn[captured receiver].Path,true,main.Reloader,closure main.(*Handler).Apply-fm,main.Handler,main.ID
+needle,main.G,named[captured named].Name,true,closure main.main.func1,main.Named,main.ID3
+needle,main.G,basic[captured needle],true,closure main.main.func2
 ```
 
 A closure counts as a non-basic type on the path, so a plain string it captured is reported, as in the last row.
@@ -101,12 +106,12 @@ The program is never stopped or attached to. All instrumentation happens at comp
 
 ## Tested
 
-`go test .` builds the example under argmatch and checks the matches for `F` three ways: with `-match needle` against the output above, with a match file, and with `-stacklog testdata/stacks.log` and no `-func`. It also checks the closure output for `G` above. It takes a few seconds (longer with a cold build cache) and is skipped by `go test -short`.
+`go test .` builds the example under argmatch and checks the matches for `F` three ways: with `-match needle` against the output above, with a match file, and with `-stacklog testdata/stacks.log` and no `-func`. It also checks that exact matching and ignoring closures are the defaults, `-recvonly`, and the closure output for `G` above. It takes a few seconds (longer with a cold build cache) and is skipped by `go test -short`.
 
 Also tested by hand:
 
 - **Standard library:** `-func 'net.(*sysDialer).dialSerial' -match 127.0.0.1` reports `127.0.0.1:<port>` at `sd.address` with type `net.sysDialer`. That's a package delve itself depends on.
-- **Stack log from prombench:** Prometheus built with `-stacklog` set to a prometheus-meta pod log (92k connections, 252 distinct functions) builds in 25 s. Running it with `-match prometheus.yml` reports matches in `main.reloadConfig`, `web.(*Handler).Run`, `route.(*Router).handle` and the promhttp handlers. Nearly all of them (377 of 384 distinct rows) are through closures, e.g. expression `rls[2].reloader[captured receiver].flagsMap["config.file"]` with steps `main.reloader`, `closure github.com/prometheus/prometheus/web.(*Handler).ApplyConfig-fm`, `github.com/prometheus/prometheus/web.Handler`.
+- **Stack log from prombench:** Prometheus built with `-stacklog` set to a prometheus-meta pod log (92k connections, 252 distinct functions) builds in 25 s. Running it with `-match prometheus.yml -exact=false -ignoreclosures=false` reports matches in `main.reloadConfig`, `web.(*Handler).Run`, `route.(*Router).handle` and the promhttp handlers. Nearly all of them (377 of 384 distinct rows) are through closures, e.g. expression `rls[2].reloader[captured receiver].flagsMap["config.file"]` with steps `main.reloader`, `closure github.com/prometheus/prometheus/web.(*Handler).ApplyConfig-fm`, `github.com/prometheus/prometheus/web.Handler`.
 - **Edge cases:** unnamed and `_` parameters, a generic receiver (`main.G[main.Name]`), `any` holding a plain string, and two goroutines calling the function at the same time all work. The depth limit cuts off deeper struct nesting as expected.
 - **Byte slices:** `[]byte` and byte arrays are matched like strings. A plain `[]byte` argument prints nothing, but a named `type B []byte`, a `[]byte` field in a named struct, and a `[]byte` in an `any` are reported.
 
@@ -117,7 +122,7 @@ Also tested by hand:
 - **What `-depth` counts:** it's delve's `MaxVariableRecurse`. Pointers don't count as a level, so `-depth 2` reaches `l.X.X.N` in `L1{L2{L3{N}}}` and `-depth 1` doesn't.
 - **Function names** use delve's naming: `pkg/path.Func`, `pkg.T.M` or `pkg.(*T).M`, which is also how they appear in stacktraces. Functions written in assembly can't be instrumented.
 - **Names in stack logs** are mapped to declarations by `stacklog.EnclosingFns`, which `parse` uses too. Closures and `go`/`defer` wrappers (`pkg.F.func1.2`, `pkg.F.gowrap1`) mean the function that contains them, and method values (`pkg.T.M-fm`) mean the method. A closure in an inlined function is named after both functions (`pkg.(*T).Run.helper.func5`), and both are checked (`pkg.helper` and `pkg.(*T).Run`). That's guessed from the name, so it can't recover an inlined function from another package, and a value-receiver method inlined into a function is misread. The comment on `EnclosingFns` describes an exact alternative using the frames' file:line.
-- **What is matched:** string values and `[]byte`/byte array contents. A value matches if it contains the *full* match string anywhere, so `-match needle` reports `"xneedlex"`. The output shows both the match string (`needle`) and the whole value that contained it (`haystack`). A value that contains several match strings gives one row per string. Strings are loaded up to 64 KiB and arrays up to 4096 elements.
+- **What is matched:** string values and `[]byte`/byte array contents. By default a value matches only if it equals a match string exactly. With `-exact=false` (env `ARGMATCH_EXACT=false`) it also matches if it contains the full match string anywhere, so `-match needle` reports `"xneedlex"` too. The output shows both the match string (`needle`) and the whole value that contained it (`haystack`). A value that contains several match strings gives one row per string. Strings are loaded up to 64 KiB and arrays up to 4096 elements.
 - **First build is slow:** it recompiles the standard library unoptimized, about 6 s here. The cache is keyed on the settings, the wrapper binary and the helper's sources, so later builds are fast.
 - **Limitations:**
   - If the program's version of a shared module is too old for delve to compile against, the build fails.
@@ -144,7 +149,9 @@ docker run --rm -v /tmp/argmatch-out:/argmatch-out prometheus-argmatch:v3.2.1
 
 The base image runs Prometheus as `nobody`, so the host directory must be writable by that user (e.g. `chmod 777 /tmp/argmatch-out`).
 
-The Dockerfile copies `stacklog` too, at the same path relative to argmatch as here. To use a stack log, put it in the Prometheus source directory and pass `--build-arg ARGMATCH_STACKLOG=/src/<file>`. Like a match file (below), it's read during `docker build`, not when the container runs. Add `--build-arg ARGMATCH_FUNC=` to check only the log's functions, and `--build-arg ARGMATCH_RECVONLY=1` to check only their receivers.
+The output path is compiled in, so every container started from the image writes to the same path. If several of them run at once (e.g. prombench's `prometheus-meta` and `prometheus-test` pods), mount a different host directory into each, or they'll overwrite each other's output.
+
+The Dockerfile copies `stacklog` too, at the same path relative to argmatch as here. To use a stack log, put it in the Prometheus source directory and pass `--build-arg ARGMATCH_STACKLOG=/src/<file>`. Like a match file (below), it's read during `docker build`, not when the container runs. Add `--build-arg ARGMATCH_FUNC=` to check only the log's functions, and `--build-arg ARGMATCH_RECVONLY=1` to check only their receivers. Matches are exact unless you pass `--build-arg ARGMATCH_EXACT=false`, and closures are ignored unless you pass `--build-arg ARGMATCH_IGNORECLOSURES=false`.
 
 To use a match file, put it in the Prometheus source directory, which is copied to `/src` in the build stage, and pass its path there, e.g. `/src/argmatch-matches.txt`. The file is read while Prometheus is compiled, during `docker build`, so the image you run doesn't contain it; rebuild after editing it. `ARGMATCH_MATCH` defaults to the config path, so set it to empty to use only the file:
 

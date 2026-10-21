@@ -14,8 +14,8 @@
 // pkg/path.(*T).M. With -stacklog, every function in the stacktraces of a
 // connection log (in the format conftamer parses) is checked as well.
 //
-// Matches are printed to the program's stderr, or appended to the file
-// given by -out.
+// Matches are printed to the program's stderr, or written to the file
+// given by -out, overwriting it.
 //
 // The wrapper never stops the program. Instead it rewrites code at compile
 // time: it compiles everything with -N -l so values are readable, injects a
@@ -53,14 +53,16 @@ const (
 // Each flag defaults to an environment variable, for use with
 // GOFLAGS=-toolexec=/path/to/argmatch (GOFLAGS values can't contain spaces).
 var (
-	funcName  = flag.String("func", os.Getenv("ARGMATCH_FUNC"), "function to check, as named by delve (env ARGMATCH_FUNC)")
-	stackLog  = flag.String("stacklog", os.Getenv("ARGMATCH_STACKLOG"), "absolute path of a log of connection stacktraces; every function in the stacks is checked, except those stacklog.IgnoreFn ignores (env ARGMATCH_STACKLOG)")
-	needle    = flag.String("match", os.Getenv("ARGMATCH_MATCH"), "string to look for (env ARGMATCH_MATCH)")
-	matchFile = flag.String("matchfile", os.Getenv("ARGMATCH_MATCHFILE"), "absolute path of a file of strings to look for, one per line, in addition to -match; blank lines and lines starting with # are ignored (env ARGMATCH_MATCHFILE)")
-	recvOnly  = flag.Bool("recvonly", envBool("ARGMATCH_RECVONLY"), "check only method receivers, not parameters; functions without a receiver are skipped (env ARGMATCH_RECVONLY)")
-	depth     = flag.Int("depth", envInt("ARGMATCH_DEPTH", 5), "how many levels of nested structs, arrays, maps and pointers-to-pointers to load (delve's MaxVariableRecurse; env ARGMATCH_DEPTH)")
-	outPath   = flag.String("out", os.Getenv("ARGMATCH_OUT"), "file the program appends its matches to, resolved against the program's working directory (default: stderr; env ARGMATCH_OUT)")
-	rtDir     = flag.String("rtdir", os.Getenv("ARGMATCH_RTDIR"), "directory of the argmatch module (default: the directory containing this executable; env ARGMATCH_RTDIR)")
+	funcName       = flag.String("func", os.Getenv("ARGMATCH_FUNC"), "function to check, as named by delve (env ARGMATCH_FUNC)")
+	stackLog       = flag.String("stacklog", os.Getenv("ARGMATCH_STACKLOG"), "absolute path of a log of connection stacktraces; every function in the stacks is checked, except those stacklog.IgnoreFn ignores (env ARGMATCH_STACKLOG)")
+	needle         = flag.String("match", os.Getenv("ARGMATCH_MATCH"), "string to look for (env ARGMATCH_MATCH)")
+	matchFile      = flag.String("matchfile", os.Getenv("ARGMATCH_MATCHFILE"), "absolute path of a file of strings to look for, one per line, in addition to -match; blank lines and lines starting with # are ignored (env ARGMATCH_MATCHFILE)")
+	exact          = flag.Bool("exact", envBool("ARGMATCH_EXACT", true), "report only strings equal to a match string; -exact=false also reports strings that contain one (env ARGMATCH_EXACT)")
+	ignoreClosures = flag.Bool("ignoreclosures", envBool("ARGMATCH_IGNORECLOSURES", true), "don't check the variables captured by closures and method values; -ignoreclosures=false checks them too (env ARGMATCH_IGNORECLOSURES)")
+	recvOnly       = flag.Bool("recvonly", envBool("ARGMATCH_RECVONLY", false), "check only method receivers, not parameters; functions without a receiver are skipped (env ARGMATCH_RECVONLY)")
+	depth          = flag.Int("depth", envInt("ARGMATCH_DEPTH", 5), "how many levels of nested structs, arrays, maps and pointers-to-pointers to load (delve's MaxVariableRecurse; env ARGMATCH_DEPTH)")
+	outPath        = flag.String("out", os.Getenv("ARGMATCH_OUT"), "file the program writes its matches to, overwriting it; resolved against the program's working directory (default: stderr; env ARGMATCH_OUT)")
+	rtDir          = flag.String("rtdir", os.Getenv("ARGMATCH_RTDIR"), "directory of the argmatch module (default: the directory containing this executable; env ARGMATCH_RTDIR)")
 )
 
 // needles holds -match and the lines of -matchfile.
@@ -178,11 +180,14 @@ func envInt(name string, def int) int {
 	return def
 }
 
-// envBool reports whether the environment variable is set to a true value
-// as strconv.ParseBool sees it (1, t, true, ...).
-func envBool(name string) bool {
-	b, _ := strconv.ParseBool(os.Getenv(name))
-	return b
+// envBool returns the environment variable's value as strconv.ParseBool
+// sees it (1, t, true, 0, f, false, ...), or def if it's unset or not a
+// boolean.
+func envBool(name string, def bool) bool {
+	if b, err := strconv.ParseBool(os.Getenv(name)); err == nil {
+		return b
+	}
+	return def
 }
 
 func main() {
@@ -247,7 +252,7 @@ func printToolID(tool string) {
 		rtFiles, err := filepath.Glob(filepath.Join(*rtDir, "rt", "*.go"))
 		check(err)
 		h := sha256.New()
-		fmt.Fprintf(h, "%q %q %d %q %t ", slices.Sorted(maps.Keys(funcs)), needles, *depth, *outPath, *recvOnly)
+		fmt.Fprintf(h, "%q %q %t %t %d %q %t ", slices.Sorted(maps.Keys(funcs)), needles, *exact, *ignoreClosures, *depth, *outPath, *recvOnly)
 		for _, f := range append([]string{self, filepath.Join(*rtDir, "go.mod"), filepath.Join(*rtDir, "go.sum")}, rtFiles...) {
 			b, err := os.ReadFile(f)
 			check(err)
@@ -307,7 +312,7 @@ func compileArgs(tool string, args []string, tmp string) []string {
 			// instead, declaring it once per package.
 			edits = append(edits,
 				edit{fset.Position(f.Name.End()).Offset, `; import _ "unsafe"`},
-				edit{len(src), fmt.Sprintf("\n//go:linkname %s %s.Check\nfunc %s([]string, int, string, string, []string, []interface{})\n", checkFn, rtPkg, checkFn)},
+				edit{len(src), fmt.Sprintf("\n//go:linkname %s %s.Check\nfunc %s([]string, bool, bool, int, string, string, []string, []interface{})\n", checkFn, rtPkg, checkFn)},
 			)
 			declared = true
 		}
@@ -437,8 +442,8 @@ func instrument(fset *token.FileSet, fd *ast.FuncDecl, fn string) []edit {
 	for i, n := range needles {
 		quotedNeedles[i] = strconv.Quote(n)
 	}
-	call := fmt.Sprintf("%s([]string{%s}, %d, %q, %q, []string{%s}, []interface{}{%s});",
-		checkFn, strings.Join(quotedNeedles, ", "), *depth, *outPath, fn, strings.Join(quoted, ", "), strings.Join(addrs, ", "))
+	call := fmt.Sprintf("%s([]string{%s}, %t, %t, %d, %q, %q, []string{%s}, []interface{}{%s});",
+		checkFn, strings.Join(quotedNeedles, ", "), *exact, *ignoreClosures, *depth, *outPath, fn, strings.Join(quoted, ", "), strings.Join(addrs, ", "))
 	return append(edits, edit{off(fd.Body.Lbrace) + 1, call})
 }
 
@@ -491,7 +496,7 @@ func rtExports(tool string) []string {
 		return `"` + s + `"`
 	}
 	toolexec := strings.Join([]string{quote(self), "-func", quote(*funcName), "-stacklog", quote(*stackLog), "-match", quote(*needle),
-		"-matchfile", quote(*matchFile), "-depth", strconv.Itoa(*depth), "-recvonly=" + strconv.FormatBool(*recvOnly),
+		"-matchfile", quote(*matchFile), "-depth", strconv.Itoa(*depth), "-recvonly=" + strconv.FormatBool(*recvOnly), "-exact=" + strconv.FormatBool(*exact), "-ignoreclosures=" + strconv.FormatBool(*ignoreClosures),
 		"-out", quote(*outPath), "-rtdir", quote(*rtDir)}, " ")
 	tmp, err := os.MkdirTemp("", "argmatch-mod")
 	check(err)

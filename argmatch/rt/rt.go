@@ -38,18 +38,20 @@ var (
 	owner int64 // goroutine ID holding mu, to detect re-entry
 )
 
-// Check reports every string in args that contains one of needles, along
-// with the named types, interfaces and closures on the path down to it, as
-// CSV rows (see csvHeader). names[i] is the source name of the parameter
-// whose address is boxed in args[i]. Output is appended to the file
-// outPath, or written to stderr if outPath is "". Errors always go to
+// Check reports every string in args that equals one of needles (or, if
+// exact is false, contains one), along with the named types, interfaces and
+// closures on the path down to it, as CSV rows (see options.header). If
+// ignoreClosures is set, the variables captured by func values aren't
+// checked. names[i] is the source name of the parameter
+// whose address is boxed in args[i]. Output goes to the file outPath,
+// which the first call overwrites, or to stderr if outPath is "". Errors always go to
 // stderr.
 //
 // The push linkname lets the injected bodyless declaration in the target
 // package (which can't import rt) refer to this function.
 //
 //go:linkname Check
-func Check(needles []string, depth int, outPath string, fn string, names []string, args []any) {
+func Check(needles []string, exact, ignoreClosures bool, depth int, outPath string, fn string, names []string, args []any) {
 	// The target function may be called by delve itself (e.g. if it's in
 	// the standard library), so ignore calls made while checking.
 	gid := goid()
@@ -63,25 +65,20 @@ func Check(needles []string, depth int, outPath string, fn string, names []strin
 	}
 	defer func() { owner = 0; mu.Unlock() }()
 
+	o := options{needles: needles, exact: exact, ignoreClosures: ignoreClosures}
 	outOnce.Do(func() {
-		header := true
 		if outPath != "" {
-			f, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+			// Overwrite any output from an earlier run.
+			f, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "argmatch: %v; writing to stderr instead\n", err)
 			} else {
 				out = f
-				// Appending to earlier output: it has a header already.
-				if fi, err := f.Stat(); err == nil && fi.Size() > 0 {
-					header = false
-				}
 			}
 		}
 		csvOut = csv.NewWriter(out)
-		if header {
-			csvOut.Write(csvHeader)
-			csvOut.Flush()
-		}
+		csvOut.Write(o.header())
+		csvOut.Flush()
 	})
 	defer csvOut.Flush()
 	initOnce.Do(load)
@@ -124,20 +121,47 @@ func Check(needles []string, depth int, outPath string, fn string, names []strin
 		}
 		arg := &box.Children[0].Children[0]
 		walk(arg, names[i], nil, func(path []string, expr, needle, val string) {
-			closure := false
-			for _, step := range path {
-				closure = closure || strings.HasPrefix(step, closurePrefix)
-			}
-			csvOut.Write(append([]string{needle, escape(val), fn, expr, strconv.FormatBool(closure)}, path...))
-		}, needles)
+			csvOut.Write(o.row(needle, val, fn, expr, path))
+		}, o)
 	}
 }
 
-// csvHeader names the columns of the output. Each row has one more column
-// per step of the path from the argument down to the match: a named type, an
-// interface ("concrete (implements interface)"), or a closure ("closure fn").
-// Rows have different lengths, so the last header names the first of them.
-var csvHeader = []string{"needle", "haystack", "function", "expression", "closure", "types"}
+// header returns the names of the output's columns. Each row has one more
+// column per step of the path from the argument down to the match: a named
+// type, an interface ("concrete (implements interface)"), or a closure
+// ("closure fn"). Rows have different lengths, so the last header names the
+// first of them. Columns whose value is the same in every row are left out:
+// haystack if matches are exact (it's always the needle), and closure if
+// closures are ignored (it's always false).
+func (o options) header() []string {
+	h := []string{"needle"}
+	if !o.exact {
+		h = append(h, "haystack")
+	}
+	h = append(h, "function", "expression")
+	if !o.ignoreClosures {
+		h = append(h, "closure")
+	}
+	return append(h, "types")
+}
+
+// row returns the output row for a match of needle in the value val, at
+// expr in fn, with path the steps on the path to it.
+func (o options) row(needle, val, fn, expr string, path []string) []string {
+	r := []string{needle}
+	if !o.exact {
+		r = append(r, escape(val))
+	}
+	r = append(r, fn, expr)
+	if !o.ignoreClosures {
+		closure := false
+		for _, step := range path {
+			closure = closure || strings.HasPrefix(step, closurePrefix)
+		}
+		r = append(r, strconv.FormatBool(closure))
+	}
+	return append(r, path...)
+}
 
 // closurePrefix starts the path step for a closure; no type name starts
 // with it.
@@ -165,10 +189,25 @@ func escape(s string) string {
 	return b.String()
 }
 
+// options control what the walk reports.
+type options struct {
+	needles        []string
+	exact          bool // a string matches only if it equals the needle, not if it just contains it
+	ignoreClosures bool // don't walk the variables captured by func values
+}
+
+// matches reports whether s matches needle.
+func (o options) matches(s, needle string) bool {
+	if o.exact {
+		return s == needle
+	}
+	return strings.Contains(s, needle)
+}
+
 // walk calls report for each string or []byte in v's tree and each of
-// needles it contains, if any named type or interface lies on the path to
-// it. path holds those types.
-func walk(v *proc.Variable, expr string, path []string, report func(path []string, expr, needle, val string), needles []string) {
+// o's needles it matches, if any named type or interface lies on the path
+// to it. path holds those types.
+func walk(v *proc.Variable, expr string, path []string, report func(path []string, expr, needle, val string), o options) {
 	if v.Unreadable != nil || v.DwarfType == nil {
 		return
 	}
@@ -179,21 +218,21 @@ func walk(v *proc.Variable, expr string, path []string, report func(path []strin
 		// continue below the dynamic value so it isn't reported twice.
 		data := &v.Children[0]
 		path = append(path, fmt.Sprintf("%s (implements %s)", data.DwarfType.String(), typ))
-		walkValue(data, expr, path, report, needles)
+		walkValue(data, expr, path, report, o)
 		return
 	case isNamed(typ):
 		path = append(path, typ)
 	}
-	walkValue(v, expr, path, report, needles)
+	walkValue(v, expr, path, report, o)
 }
 
 // walkValue checks v itself, whose type is already accounted for in path,
 // then walks its children.
-func walkValue(v *proc.Variable, expr string, path []string, report func(path []string, expr, needle, val string), needles []string) {
+func walkValue(v *proc.Variable, expr string, path []string, report func(path []string, expr, needle, val string), o options) {
 	if len(path) > 0 {
 		if s, ok := stringValue(v); ok {
-			for _, needle := range needles {
-				if strings.Contains(s, needle) {
+			for _, needle := range o.needles {
+				if o.matches(s, needle) {
 					report(path, expr, needle, s)
 				}
 			}
@@ -202,7 +241,10 @@ func walkValue(v *proc.Variable, expr string, path []string, report func(path []
 	if v.Kind == reflect.Func && len(v.Children) > 0 {
 		// A closure (or method value), whose children are the variables
 		// it captured. Name it on the path, so that matches reached
-		// through it are clearly marked.
+		// through it are clearly marked, or skip it.
+		if o.ignoreClosures {
+			return
+		}
 		fn := ""
 		if v.Value != nil {
 			fn = constant.StringVal(v.Value)
@@ -241,7 +283,7 @@ func walkValue(v *proc.Variable, expr string, path []string, report func(path []
 		default:
 			cexpr = fmt.Sprintf("%s[%d]", expr, i)
 		}
-		walk(c, cexpr, path, report, needles)
+		walk(c, cexpr, path, report, o)
 	}
 }
 

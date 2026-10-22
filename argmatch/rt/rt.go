@@ -42,16 +42,18 @@ var (
 // exact is false, contains one), along with the named types, interfaces and
 // closures on the path down to it, as CSV rows (see options.header). If
 // ignoreClosures is set, the variables captured by func values aren't
-// checked. names[i] is the source name of the parameter
-// whose address is boxed in args[i]. Output goes to the file outPath,
-// which the first call overwrites, or to stderr if outPath is "". Errors always go to
-// stderr.
+// checked. Values are loaded depth levels deep, and only the first maxElems
+// elements of each array, slice and map; delve loads the whole tree before
+// it's walked, so the two together bound its size. names[i] is the source
+// name of the parameter whose address is boxed in args[i]. Output goes to
+// the file outPath, which the first call overwrites, or to stderr if outPath
+// is "". Errors always go to stderr.
 //
 // The push linkname lets the injected bodyless declaration in the target
 // package (which can't import rt) refer to this function.
 //
 //go:linkname Check
-func Check(needles []string, exact, ignoreClosures bool, depth int, outPath string, fn string, names []string, args []any) {
+func Check(needles []string, exact, ignoreClosures bool, depth, maxElems int, outPath string, fn string, names []string, args []any) {
 	// The target function may be called by delve itself (e.g. if it's in
 	// the standard library), so ignore calls made while checking.
 	gid := goid()
@@ -91,7 +93,7 @@ func Check(needles []string, exact, ignoreClosures bool, depth int, outPath stri
 		FollowPointers:     true,
 		MaxVariableRecurse: depth,
 		MaxStringLen:       1 << 16,
-		MaxArrayValues:     1 << 12,
+		MaxArrayValues:     maxElems, // also bounds map entries
 		MaxStructFields:    -1,
 	}
 	for i := range args {

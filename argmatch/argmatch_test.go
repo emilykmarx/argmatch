@@ -42,6 +42,19 @@ func TestRecvOnly(t *testing.T) {
 	}
 }
 
+// TestMaxElems checks that -maxelems limits how many map entries are
+// loaded: with 0, the match in h's key isn't found.
+func TestMaxElems(t *testing.T) {
+	got := runExample(t, "-func", "main.ID.F", "-match", "needle", "-maxelems", "0")
+	want := strings.Replace(wantF, "needle,main.ID.F,\"h<key \"\"needle\"\">\",main.Hier\n", "", 1)
+	if want == wantF {
+		t.Fatal("test bug: h row not in wantF")
+	}
+	if got != want {
+		t.Errorf("matches:\n%s\nwant:\n%s", got, want)
+	}
+}
+
 // TestIgnoreClosuresDefault checks that by default the variables captured
 // by func values aren't checked: G's only matches are through closures.
 func TestIgnoreClosuresDefault(t *testing.T) {

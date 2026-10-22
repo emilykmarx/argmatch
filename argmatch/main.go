@@ -10,7 +10,7 @@
 //	go build -toolexec "/path/to/argmatch -stacklog /abs/path/stacks.log -match needle" .
 //
 // The function may be in any package of the build, including the standard
-// library, and is named as delve names it: pkg/path.Func, pkg/path.T.M or
+// library, and is named as in stacktraces: pkg/path.Func, pkg/path.T.M or
 // pkg/path.(*T).M. With -stacklog, every function in the stacktraces of a
 // connection log (in the format conftamer parses) is checked as well.
 //
@@ -18,10 +18,9 @@
 // given by -out, overwriting it.
 //
 // The wrapper never stops the program. Instead it rewrites code at compile
-// time: it compiles everything with -N -l so values are readable, injects a
-// call to argmatch/rt.Check at the top of the function, and links in
-// argmatch/rt, which evaluates the arguments with delve from inside the
-// program.
+// time: it injects a call to argmatch/rt.Check at the top of the function,
+// passing the addresses of its receiver and arguments, and links in
+// argmatch/rt, which walks them with reflect from inside the program.
 package main
 
 import (
@@ -36,7 +35,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -53,16 +51,16 @@ const (
 // Each flag defaults to an environment variable, for use with
 // GOFLAGS=-toolexec=/path/to/argmatch (GOFLAGS values can't contain spaces).
 var (
-	funcName       = flag.String("func", os.Getenv("ARGMATCH_FUNC"), "function to check, as named by delve (env ARGMATCH_FUNC)")
+	funcName       = flag.String("func", os.Getenv("ARGMATCH_FUNC"), "function to check, as named in stacktraces (env ARGMATCH_FUNC)")
 	stackLog       = flag.String("stacklog", os.Getenv("ARGMATCH_STACKLOG"), "absolute path of a log of connection stacktraces; every function in the stacks is checked, except those stacklog.IgnoreFn ignores (env ARGMATCH_STACKLOG)")
 	needle         = flag.String("match", os.Getenv("ARGMATCH_MATCH"), "string to look for (env ARGMATCH_MATCH)")
 	matchFile      = flag.String("matchfile", os.Getenv("ARGMATCH_MATCHFILE"), "absolute path of a file of strings to look for, one per line, in addition to -match; blank lines and lines starting with # are ignored (env ARGMATCH_MATCHFILE)")
 	exact          = flag.Bool("exact", envBool("ARGMATCH_EXACT", true), "report only strings equal to a match string; -exact=false also reports strings that contain one (env ARGMATCH_EXACT)")
-	ignoreClosures = flag.Bool("ignoreclosures", envBool("ARGMATCH_IGNORECLOSURES", true), "don't check the variables captured by closures and method values; -ignoreclosures=false checks them too (env ARGMATCH_IGNORECLOSURES)")
+	ignoreClosures = flag.Bool("ignoreclosures", envBool("ARGMATCH_IGNORECLOSURES", true), "don't check the variables captured by closures and method values; must be true, since this version can't check them (env ARGMATCH_IGNORECLOSURES)")
 	recvOnly       = flag.Bool("recvonly", envBool("ARGMATCH_RECVONLY", false), "check only method receivers, not parameters; functions without a receiver are skipped (env ARGMATCH_RECVONLY)")
-	depth          = flag.Int("depth", envInt("ARGMATCH_DEPTH", 5), "how many levels of nested structs, arrays, maps and pointers-to-pointers to load (delve's MaxVariableRecurse; env ARGMATCH_DEPTH)")
+	depth          = flag.Int("depth", envInt("ARGMATCH_DEPTH", 5), "how many levels of nested structs, arrays, maps and pointers-to-pointers to check (pointers don't count; env ARGMATCH_DEPTH)")
 	maxCalls       = flag.Int("maxcalls", envInt("ARGMATCH_MAXCALLS", 3), "check only the first maxcalls calls of each function; later calls skip the check and cost almost nothing; 0 means no limit (env ARGMATCH_MAXCALLS)")
-	maxElems       = flag.Int("maxelems", envInt("ARGMATCH_MAXELEMS", 64), "how many elements of each array, slice and map to load (delve's MaxArrayValues); the loaded tree grows roughly as maxelems^depth, and the default was tested with Prometheus up to -depth 10 (env ARGMATCH_MAXELEMS)")
+	maxElems       = flag.Int("maxelems", envInt("ARGMATCH_MAXELEMS", 64), "how many elements of each array, slice and map to check; the work per check grows roughly as maxelems^depth (env ARGMATCH_MAXELEMS)")
 	outPath        = flag.String("out", os.Getenv("ARGMATCH_OUT"), "file the program writes its matches to, overwriting it; resolved against the program's working directory (default: stderr; env ARGMATCH_OUT)")
 	rtDir          = flag.String("rtdir", os.Getenv("ARGMATCH_RTDIR"), "directory of the argmatch module (default: the directory containing this executable; env ARGMATCH_RTDIR)")
 )
@@ -202,6 +200,10 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
+	if !*ignoreClosures {
+		fmt.Fprintln(os.Stderr, "argmatch: -ignoreclosures=false isn't supported: this version walks values with reflect, which can't see the variables closures capture")
+		os.Exit(2)
+	}
 	needles = loadNeedles()
 	loadFuncs()
 	if *rtDir == "" {
@@ -265,15 +267,16 @@ func printToolID(tool string) {
 	fmt.Println(line)
 }
 
-// compileArgs disables optimizations, injects the call to rt.Check if the
-// package contains the target function, and imports rt into main packages.
+// compileArgs injects the call to rt.Check if the package contains a target
+// function, and imports rt into main packages. Packages are otherwise
+// compiled as usual, with optimizations.
 func compileArgs(tool string, args []string, tmp string) []string {
 	pkg := ""
 	if i := slices.Index(args, "-p"); i >= 0 && i+1 < len(args) {
 		pkg = args[i+1]
 	}
 	isStd := slices.Contains(args, "-std")
-	args = append([]string{"-N", "-l"}, args...)
+	args = slices.Clone(args)
 	isMain := pkg == "main" && os.Getenv(nestedEnv) == ""
 	injectedMain, declared := false, false
 	instrumented := 0 // functions instrumented so far, to name their call counters
@@ -307,7 +310,8 @@ func compileArgs(tool string, args []string, tmp string) []string {
 				}
 				continue
 			}
-			edits = append(edits, instrument(fset, fd, name, instrumented, len(src))...)
+			// Only standard library functions can be called by rt itself.
+			edits = append(edits, instrument(fset, fd, name, instrumented, len(src), isStd)...)
 			instrumented++
 		}
 		if len(edits) > 0 && !declared {
@@ -316,7 +320,8 @@ func compileArgs(tool string, args []string, tmp string) []string {
 			// instead, declaring it once per package.
 			edits = append(edits,
 				edit{fset.Position(f.Name.End()).Offset, `; import _ "unsafe"`},
-				edit{len(src), fmt.Sprintf("\n//go:linkname %s %s.Check\nfunc %s(*uint32, int, []string, bool, bool, int, int, string, string, []string, []interface{})\n", checkFn, rtPkg, checkFn)},
+				edit{len(src), fmt.Sprintf("\n//go:linkname %s %s.Check\nfunc %s(*uint32, int, bool, []string, bool, bool, int, int, string, string, []string, []interface{})\nvar %s_needles = %s\n",
+					checkFn, rtPkg, checkFn, checkFn, goStrings(needles))},
 			)
 			declared = true
 		}
@@ -358,7 +363,7 @@ type edit struct {
 }
 
 // matchesFunc reports whether fd, in package pkg, is one of the functions
-// to check, and returns its name as delve names it. explicit reports
+// to check, and returns its name as stacktraces name it. explicit reports
 // whether it was given by -func. Functions found only in -stacklog are
 // skipped if stacklog.IgnoreFn ignores them; isStd reports whether pkg is
 // in the standard library.
@@ -377,7 +382,7 @@ func matchesFunc(pkg string, isStd bool, fd *ast.FuncDecl) (name string, explici
 	return name, false, true
 }
 
-// funcDeclName returns the name delve gives fd, in package pkg, or "" if
+// funcDeclName returns the name stacktraces give fd, in package pkg, or "" if
 // it can't tell.
 func funcDeclName(pkg string, fd *ast.FuncDecl) string {
 	name := pkg + "." + fd.Name.Name
@@ -411,10 +416,11 @@ func funcDeclName(pkg string, fd *ast.FuncDecl) string {
 
 // instrument returns the edits that make fd, named fn, call rt.Check with
 // the addresses of its receiver and parameters (only the receiver with
-// -recvonly), naming unnamed ones. fd gets a call counter for -maxcalls,
-// declared at the end of its file (size bytes long) and named with id,
-// which is unique among the package's instrumented functions.
-func instrument(fset *token.FileSet, fd *ast.FuncDecl, fn string, id, size int) []edit {
+// -recvonly), naming unnamed ones. fd gets a call counter for -maxcalls and
+// a list of its parameter names, declared at the end of its file (size bytes
+// long) and named with id, which is unique among the package's instrumented
+// functions. guard is passed on to rt.Check.
+func instrument(fset *token.FileSet, fd *ast.FuncDecl, fn string, id, size int, guard bool) []edit {
 	off := func(p token.Pos) int { return fset.Position(p).Offset }
 	var edits []edit
 	var names, addrs []string
@@ -431,30 +437,34 @@ func instrument(fset *token.FileSet, fd *ast.FuncDecl, fn string, id, size int) 
 			edits = append(edits, edit{off(field.Type.Pos()), name + " "})
 			names, addrs = append(names, "_"), append(addrs, "&"+name)
 		}
-		for _, id := range field.Names {
-			name := id.Name
+		for _, ident := range field.Names {
+			name := ident.Name
 			if name == "_" {
 				name = fmt.Sprintf("__argmatch_%d", len(names))
-				edits = append(edits, edit{off(id.Pos()) + 1, name[1:]}) // "_" + "_argmatch_N"
+				edits = append(edits, edit{off(ident.Pos()) + 1, name[1:]}) // "_" + "_argmatch_N"
 			}
-			names, addrs = append(names, id.Name), append(addrs, "&"+name)
+			names, addrs = append(names, ident.Name), append(addrs, "&"+name)
 		}
 	}
-	quoted := make([]string, len(names))
-	for i, n := range names {
-		quoted[i] = strconv.Quote(n)
-	}
-	quotedNeedles := make([]string, len(needles))
-	for i, n := range needles {
-		quotedNeedles[i] = strconv.Quote(n)
-	}
+	// The needles (declared once per package) and the names are
+	// package-level variables, so the call doesn't allocate them each time.
 	calls := fmt.Sprintf("%s_calls_%d", checkFn, id)
-	call := fmt.Sprintf("%s(&%s, %d, []string{%s}, %t, %t, %d, %d, %q, %q, []string{%s}, []interface{}{%s});",
-		checkFn, calls, *maxCalls, strings.Join(quotedNeedles, ", "), *exact, *ignoreClosures, *depth, *maxElems, *outPath, fn, strings.Join(quoted, ", "), strings.Join(addrs, ", "))
+	namesVar := fmt.Sprintf("%s_names_%d", checkFn, id)
+	call := fmt.Sprintf("%s(&%s, %d, %t, %s_needles, %t, %t, %d, %d, %q, %q, %s, []interface{}{%s});",
+		checkFn, calls, *maxCalls, guard, checkFn, *exact, *ignoreClosures, *depth, *maxElems, *outPath, fn, namesVar, strings.Join(addrs, ", "))
 	return append(edits,
 		edit{off(fd.Body.Lbrace) + 1, call},
-		edit{size, fmt.Sprintf("\nvar %s uint32\n", calls)},
+		edit{size, fmt.Sprintf("\nvar %s uint32\nvar %s = %s\n", calls, namesVar, goStrings(names))},
 	)
+}
+
+// goStrings returns a Go []string literal holding ss.
+func goStrings(ss []string) string {
+	quoted := make([]string, len(ss))
+	for i, s := range ss {
+		quoted[i] = strconv.Quote(s)
+	}
+	return "[]string{" + strings.Join(quoted, ", ") + "}"
 }
 
 // withRT adds rt and its dependencies to the -importcfg in args.
@@ -488,10 +498,10 @@ func withRT(tool string, args []string, tmp string) []string {
 	return args
 }
 
-// rtExports builds rt and its dependencies the same way as the outer build,
-// so that packages shared with the program are identical, and returns
-// their "importpath=archive" pairs. That means using this wrapper, the
-// outer build's flags, and the program's versions of shared modules.
+// rtExports builds rt and its dependencies (all in the standard library)
+// the same way as the outer build, so that packages shared with the
+// program are identical, and returns their "importpath=archive" pairs.
+// That means using this wrapper and the outer build's flags.
 func rtExports(tool string) []string {
 	goroot := filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(tool)))) // $GOROOT/pkg/tool/GOOS_GOARCH/compile
 	goCmd := filepath.Join(goroot, "bin", "go")
@@ -508,11 +518,7 @@ func rtExports(tool string) []string {
 	toolexec := strings.Join([]string{quote(self), "-func", quote(*funcName), "-stacklog", quote(*stackLog), "-match", quote(*needle),
 		"-matchfile", quote(*matchFile), "-depth", strconv.Itoa(*depth), "-maxelems", strconv.Itoa(*maxElems), "-maxcalls", strconv.Itoa(*maxCalls), "-recvonly=" + strconv.FormatBool(*recvOnly), "-exact=" + strconv.FormatBool(*exact), "-ignoreclosures=" + strconv.FormatBool(*ignoreClosures),
 		"-out", quote(*outPath), "-rtdir", quote(*rtDir)}, " ")
-	tmp, err := os.MkdirTemp("", "argmatch-mod")
-	check(err)
-	defer os.RemoveAll(tmp)
-	args := []string{"list", "-deps", "-export", "-toolexec", toolexec,
-		"-modfile", alignedModfile(goCmd, tmp), "-mod=mod"}
+	args := []string{"list", "-deps", "-export", "-toolexec", toolexec, "-mod=mod"}
 	args = append(args, outerBuildFlags()...)
 	cmd := exec.Command(goCmd, append(args, "-f", "{{if .Export}}{{.ImportPath}}={{.Export}}{{end}}", rtPkg)...)
 	cmd.Dir = *rtDir
@@ -524,46 +530,6 @@ func rtExports(tool string) []string {
 		os.Exit(1)
 	}
 	return strings.Fields(string(out))
-}
-
-// alignedModfile writes a copy of rt's go.mod (and go.sum) to dir that
-// pins every module the program also uses to the program's version, and
-// returns its path. The program's module is found from the current
-// directory, which the go command sets to the package being built.
-func alignedModfile(goCmd, dir string) string {
-	mod, err := os.ReadFile(filepath.Join(*rtDir, "go.mod"))
-	check(err)
-	sum, _ := os.ReadFile(filepath.Join(*rtDir, "go.sum"))
-	list := exec.Command(goCmd, "list", "-m", "-f",
-		"{{if not .Main}}{{.Path}} {{with .Replace}}{{if .Version}}{{.Path}} {{.Version}}{{else}}{{.Dir}}{{end}}{{else}}{{.Path}} {{.Version}}{{end}}{{end}}", "all")
-	list.Env = append(os.Environ(), "GOFLAGS=-mod=readonly")
-	list.Stderr = os.Stderr
-	out, err := list.Output()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "argmatch: listing the program's modules:", err)
-		os.Exit(1)
-	}
-	// The copy is in another directory, so make rt's own local replacements
-	// absolute.
-	mod = regexp.MustCompile(`(?m)^(replace \S+ => )(\.\.?/\S*)$`).ReplaceAllFunc(mod, func(line []byte) []byte {
-		prefix, path, _ := strings.Cut(string(line), "=> ")
-		return []byte(prefix + "=> " + filepath.Join(*rtDir, path))
-	})
-	mod = append(mod, '\n')
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if f := strings.Fields(line); len(f) >= 2 {
-			mod = fmt.Appendf(mod, "replace %s => %s\n", f[0], strings.Join(f[1:], " "))
-		}
-	}
-	if gomod, err := exec.Command(goCmd, "env", "GOMOD").Output(); err == nil {
-		if s := strings.TrimSpace(string(gomod)); s != "" && s != os.DevNull {
-			progSum, _ := os.ReadFile(filepath.Join(filepath.Dir(s), "go.sum"))
-			sum = append(append(sum, '\n'), progSum...)
-		}
-	}
-	check(os.WriteFile(filepath.Join(dir, "go.mod"), mod, 0o644))
-	check(os.WriteFile(filepath.Join(dir, "go.sum"), sum, 0o644))
-	return filepath.Join(dir, "go.mod")
 }
 
 // outerBuildFlags returns the flags of the go command that ran this wrapper

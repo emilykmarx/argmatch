@@ -4,7 +4,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -82,17 +81,23 @@ func TestIgnoreClosuresDefault(t *testing.T) {
 	}
 }
 
-// TestClosure checks that with -ignoreclosures=false, matches reached
-// through a func value's captured variables are reported, marked with the
-// closure and the captured variable. With -exact=false as well, all the
-// columns are written.
-func TestClosure(t *testing.T) {
-	got := runExample(t, "-func", "main.G", "-match", "needle", "-ignoreclosures=false", "-exact=false")
-	want := "needle,haystack,function,expression,closure,types\n" +
-		`needle,needle,main.G,r.Fn[captured receiver].Path,true,main.Reloader,closure main.(*Handler).Apply-fm,main.Handler,main.ID
-needle,needle,main.G,named[captured named].Name,true,closure main.main.func1,main.Named,main.ID3
-needle,needle,main.G,basic[captured needle],true,closure main.main.func2
-`
+// TestClosuresUnsupported checks that -ignoreclosures=false is refused,
+// since reflect can't see the variables closures capture.
+func TestClosuresUnsupported(t *testing.T) {
+	tmp := t.TempDir()
+	wrapper := filepath.Join(tmp, "argmatch")
+	run(t, ".", "go", "build", "-o", wrapper, ".")
+	cmd := exec.Command(wrapper, "-func", "main.G", "-match", "needle", "-ignoreclosures=false", "compile")
+	out, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "-ignoreclosures=false isn't supported") {
+		t.Errorf("argmatch -ignoreclosures=false: err %v, output %q; want an error saying it isn't supported", err, out)
+	}
+}
+
+// TestFullColumns checks that -exact=false adds the haystack column.
+func TestFullColumns(t *testing.T) {
+	got := runExample(t, "-func", "main.ID.F", "-match", "needle", "-exact=false", "-recvonly")
+	want := "needle,haystack,function,expression,types\nneedle,needle,main.ID.F,id_recvr,main.ID\n"
 	if got != want {
 		t.Errorf("matches:\n%s\nwant:\n%s", got, want)
 	}
@@ -170,11 +175,8 @@ func TestLoadNeedles(t *testing.T) {
 // flags, runs it, and returns the matches it reports.
 func runExample(t *testing.T, flags ...string) string {
 	t.Helper()
-	if runtime.GOOS != "linux" {
-		t.Skip("rt reads /proc/self")
-	}
 	if testing.Short() {
-		t.Skip("builds the standard library without optimizations")
+		t.Skip("rebuilds the standard library under argmatch")
 	}
 	rtDir, err := filepath.Abs(".")
 	if err != nil {

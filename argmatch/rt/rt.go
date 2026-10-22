@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unicode/utf8"
 	"unsafe"
 
@@ -49,11 +50,26 @@ var (
 // the file outPath, which the first call overwrites, or to stderr if outPath
 // is "". Errors always go to stderr.
 //
+// calls counts the calls of fn so far (each instrumented function has its
+// own counter). Once it reaches maxCalls, Check returns at once, before
+// taking the lock that serializes checks, so later calls cost almost
+// nothing. maxCalls 0 means no limit.
+//
 // The push linkname lets the injected bodyless declaration in the target
 // package (which can't import rt) refer to this function.
 //
 //go:linkname Check
-func Check(needles []string, exact, ignoreClosures bool, depth, maxElems int, outPath string, fn string, names []string, args []any) {
+func Check(calls *uint32, maxCalls int, needles []string, exact, ignoreClosures bool, depth, maxElems int, outPath string, fn string, names []string, args []any) {
+	if maxCalls > 0 {
+		// Load first, so the counter stops growing (and can't wrap)
+		// once the limit is reached. Concurrent first calls may overshoot
+		// the limit slightly. Calls of fn made by delve itself while
+		// checking (if fn is in the standard library) count too.
+		if atomic.LoadUint32(calls) >= uint32(maxCalls) {
+			return
+		}
+		atomic.AddUint32(calls, 1)
+	}
 	// The target function may be called by delve itself (e.g. if it's in
 	// the standard library), so ignore calls made while checking.
 	gid := goid()

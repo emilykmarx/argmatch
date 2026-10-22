@@ -70,6 +70,9 @@ type Reloader struct {
 // Closure capturing a basic string
 func G(r Reloader, named func(), basic func()) {}
 
+// Called several times, for -maxcalls
+func Repeat(in Named) {}
+
 func main() {
 	needle := "needle"
 	id := ID(needle)
@@ -80,5 +83,8 @@ func main() {
 	id.F(ID2(needle), hier, []string{needle}, named, &out, ID5(needle))
 	h := &Handler{Path: ID(needle)}
 	G(Reloader{Name: "r", Fn: h.Apply}, func() { _ = named }, func() { _ = needle })
+	for range 5 {
+		Repeat(named)
+	}
 	fmt.Println("done")
 }

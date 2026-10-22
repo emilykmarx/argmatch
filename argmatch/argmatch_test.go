@@ -55,6 +55,25 @@ func TestMaxElems(t *testing.T) {
 	}
 }
 
+// TestMaxCalls checks that only the first -maxcalls calls of a function are
+// checked (3 by default, 0 for all): Repeat is called 5 times.
+func TestMaxCalls(t *testing.T) {
+	const row = "needle,main.Repeat,in.Name,main.Named,main.ID3\n"
+	for _, test := range []struct {
+		flags []string
+		rows  int
+	}{
+		{nil, 3},
+		{[]string{"-maxcalls", "1"}, 1},
+		{[]string{"-maxcalls", "0"}, 5},
+	} {
+		got := runExample(t, append([]string{"-func", "main.Repeat", "-match", "needle"}, test.flags...)...)
+		if want := header + strings.Repeat(row, test.rows); got != want {
+			t.Errorf("%q: matches:\n%s\nwant:\n%s", test.flags, got, want)
+		}
+	}
+}
+
 // TestIgnoreClosuresDefault checks that by default the variables captured
 // by func values aren't checked: G's only matches are through closures.
 func TestIgnoreClosuresDefault(t *testing.T) {

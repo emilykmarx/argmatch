@@ -74,6 +74,58 @@ func TestMaxFields(t *testing.T) {
 	}
 }
 
+// TestMaxTime checks that loading stops at -maxtime and the stop is
+// reported: with 1ns, nothing is loaded. A generous limit changes nothing.
+func TestMaxTime(t *testing.T) {
+	got, stderr := runExampleStderr(t, "-func", "main.ID.F", "-match", "needle", "-maxtime", "1ns")
+	if got != header {
+		t.Errorf("matches:\n%s\nwant only the header", got)
+	}
+	if want := "main.ID.F: stopped loading at -maxtime"; !strings.Contains(stderr, want) {
+		t.Errorf("stderr:\n%s\nwant %q", stderr, want)
+	}
+	if got, stderr := runExampleStderr(t, "-func", "main.ID.F", "-match", "needle", "-maxtime", "1m"); got != wantF || stderr != "" {
+		t.Errorf("-maxtime 1m: matches:\n%s\nstderr:\n%s\nwant:\n%s", got, stderr, wantF)
+	}
+}
+
+// TestMaxMem checks that loading stops at -maxmem and the stop is
+// reported, keeping the matches found so far. A generous limit changes
+// nothing.
+func TestMaxMem(t *testing.T) {
+	got, stderr := runExampleStderr(t, "-func", "main.ID.F", "-match", "needle", "-maxmem", "1")
+	if want := "main.ID.F: stopped loading at -maxmem"; !strings.Contains(stderr, want) {
+		t.Errorf("stderr:\n%s\nwant %q", stderr, want)
+	}
+	// What's found depends on when the limit was hit, but it's a prefix of
+	// the full output.
+	if !strings.HasPrefix(wantF, got) || !strings.HasPrefix(got, header) {
+		t.Errorf("matches:\n%s\nwant a prefix of:\n%s", got, wantF)
+	}
+	if got, stderr := runExampleStderr(t, "-func", "main.ID.F", "-match", "needle", "-maxmem", "1GiB"); got != wantF || stderr != "" {
+		t.Errorf("-maxmem 1GiB: matches:\n%s\nstderr:\n%s\nwant:\n%s", got, stderr, wantF)
+	}
+}
+
+// TestByteSize checks how -maxmem sizes are parsed.
+func TestByteSize(t *testing.T) {
+	for s, want := range map[string]int64{
+		"0": 0, "123": 123, "2KB": 2000, "512MB": 512e6, "1GB": 1e9,
+		"1KiB": 1024, "3MiB": 3 << 20, "2GiB": 2 << 30, "7B": 7, "1 GiB": 1 << 30,
+	} {
+		var b byteSize
+		if err := b.Set(s); err != nil || int64(b) != want {
+			t.Errorf("Set(%q) = %d, %v; want %d", s, b, err, want)
+		}
+	}
+	for _, s := range []string{"", "x", "-1", "1TB", "1.5GB", "99999999999GiB"} {
+		var b byteSize
+		if err := b.Set(s); err == nil {
+			t.Errorf("Set(%q) = %d, want an error", s, b)
+		}
+	}
+}
+
 // TestMaxCalls checks that only the first -maxcalls calls of a function are
 // checked (3 by default, 0 for all): Repeat is called 5 times.
 func TestMaxCalls(t *testing.T) {
@@ -186,8 +238,20 @@ func TestLoadNeedles(t *testing.T) {
 }
 
 // runExample builds testdata/example under argmatch with the given wrapper
-// flags, runs it, and returns the matches it reports.
+// flags, runs it, and returns the matches it reports, failing if the
+// program printed anything to stderr.
 func runExample(t *testing.T, flags ...string) string {
+	t.Helper()
+	got, stderr := runExampleStderr(t, flags...)
+	if stderr != "" {
+		t.Errorf("stderr:\n%s", stderr)
+	}
+	return got
+}
+
+// runExampleStderr is like runExample, but returns the program's stderr
+// too.
+func runExampleStderr(t *testing.T, flags ...string) (matches, stderr string) {
 	t.Helper()
 	if runtime.GOOS != "linux" {
 		t.Skip("rt reads /proc/self")
@@ -208,28 +272,36 @@ func runExample(t *testing.T, flags ...string) string {
 		"-out", `"` + out + `"`, "-rtdir", `"` + rtDir + `"`}, flags...), " ")
 	example := filepath.Join(tmp, "example")
 	run(t, filepath.Join(rtDir, "testdata", "example"), "go", "build", "-toolexec", toolexec, "-o", example, ".")
-	if got := run(t, tmp, example); got != "done\n" {
+	got, stderr := runStderr(t, tmp, example)
+	if got != "done\n" {
 		t.Errorf("example printed %q, want %q", got, "done\n")
 	}
-	got, err := os.ReadFile(out)
+	data, err := os.ReadFile(out)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return string(got)
+	return string(data), stderr
 }
 
 // run runs a command in dir and returns its stdout, failing the test if
 // the command fails.
 func run(t *testing.T, dir, name string, args ...string) string {
 	t.Helper()
+	out, _ := runStderr(t, dir, name, args...)
+	return out
+}
+
+// runStderr is like run, but returns the command's stderr too.
+func runStderr(t *testing.T, dir, name string, args ...string) (stdout, stderr string) {
+	t.Helper()
 	cmd := exec.Command(name, args...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "GOWORK=off")
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
+	var errb strings.Builder
+	cmd.Stderr = &errb
 	out, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("%s %s: %v\n%s", name, strings.Join(args, " "), err, stderr.String())
+		t.Fatalf("%s %s: %v\n%s", name, strings.Join(args, " "), err, errb.String())
 	}
-	return string(out)
+	return string(out), errb.String()
 }

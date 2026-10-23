@@ -7,16 +7,19 @@ package rt
 import (
 	"bytes"
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"go/constant"
 	"io"
 	"os"
 	"reflect"
 	"runtime"
+	"runtime/metrics"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unicode/utf8"
 	"unsafe"
 
@@ -46,7 +49,10 @@ var (
 // checked. Values are loaded depth levels deep, and only the first maxElems
 // elements of each array, slice and map and the first maxFields fields of
 // each struct (-1 for all); delve loads the whole tree before it's walked,
-// so these together bound its size. names[i] is the source
+// so these together bound its size. Loading stops once it has taken
+// maxTime nanoseconds or the Go heap has grown by maxMem bytes (0 for no
+// limit; see memory.start), and the matches in what was loaded by then are
+// reported. names[i] is the source
 // name of the parameter whose address is boxed in args[i]. Output goes to
 // the file outPath, which the first call overwrites, or to stderr if outPath
 // is "". Errors always go to stderr.
@@ -60,7 +66,7 @@ var (
 // package (which can't import rt) refer to this function.
 //
 //go:linkname Check
-func Check(calls *uint32, maxCalls int, needles []string, exact, ignoreClosures bool, depth, maxElems, maxFields int, outPath string, fn string, names []string, args []any) {
+func Check(calls *uint32, maxCalls int, needles []string, exact, ignoreClosures bool, depth, maxElems, maxFields int, maxTime, maxMem int64, outPath string, fn string, names []string, args []any) {
 	if maxCalls > 0 {
 		// Load first, so the counter stops growing (and can't wrap)
 		// once the limit is reached. Concurrent first calls may overshoot
@@ -105,6 +111,10 @@ func Check(calls *uint32, maxCalls int, needles []string, exact, ignoreClosures 
 		fmt.Fprintf(os.Stderr, "argmatch: %v\n", initErr)
 		return
 	}
+	// Start the budget after the lock and the one-time load of the DWARF
+	// info, so neither counts against it.
+	selfMem.start(time.Duration(maxTime), maxMem)
+	defer selfMem.stop()
 	scope := &proc.EvalScope{BinInfo: bi, Mem: selfMem}
 	cfg := proc.LoadConfig{
 		FollowPointers:     true,
@@ -114,6 +124,11 @@ func Check(calls *uint32, maxCalls int, needles []string, exact, ignoreClosures 
 		MaxStructFields:    maxFields,
 	}
 	for i := range args {
+		if selfMem.exceeded != "" {
+			fmt.Fprintf(os.Stderr, "argmatch: %s: %s; reporting the matches in what was loaded, which doesn't include %s\n",
+				fn, selfMem.exceeded, strings.Join(names[i:], ", "))
+			return
+		}
 		// args[i] is an interface{} holding *T, where T is the parameter's
 		// static type; delve resolves *T from the runtime type.
 		expr := fmt.Sprintf("*(*interface {})(%#x)", uintptr(unsafe.Pointer(&args[i])))
@@ -142,6 +157,9 @@ func Check(calls *uint32, maxCalls int, needles []string, exact, ignoreClosures 
 		walk(arg, names[i], nil, func(path []string, expr, needle, val string) {
 			csvOut.Write(o.row(needle, val, fn, expr, path))
 		}, o)
+	}
+	if selfMem.exceeded != "" {
+		fmt.Fprintf(os.Stderr, "argmatch: %s: %s; reporting the matches in what was loaded\n", fn, selfMem.exceeded)
 	}
 }
 
@@ -394,14 +412,92 @@ func load() {
 		initErr = err
 		return
 	}
-	selfMem = &memory{f}
+	selfMem = &memory{f: f}
 }
 
 // memory reads the program's own memory through /proc/self/mem, so that
-// following a bad pointer yields an error rather than a segfault.
-type memory struct{ f *os.File }
+// following a bad pointer yields an error rather than a segfault. It's
+// used by one check at a time (under mu).
+//
+// It also enforces the check's time and memory budget. All of delve's
+// reads go through ReadMemory, so once the budget is spent, failing every
+// read stops the load quickly: delve marks each value it hasn't read yet
+// unreadable and doesn't follow it, but keeps what it has, which the walk
+// then searches as usual.
+type memory struct {
+	f *os.File
+
+	deadline time.Time // zero for no time limit
+	maxHeap  int64     // heap growth limit in bytes; 0 for none
+	baseHeap int64     // heap size when the check started
+	reads    int
+	started  time.Time
+	exceeded string // why the budget ran out, or "" if it hasn't
+}
+
+// errBudget is the error for reads after the budget has run out.
+var errBudget = errors.New("argmatch: time or memory limit reached")
+
+// heapSample is reused to read the heap size.
+var heapSample = []metrics.Sample{{Name: "/memory/classes/heap/objects:bytes"}}
+
+// heapBytes returns the bytes of heap objects: live ones, and dead ones the
+// garbage collector hasn't freed yet. It covers the whole program, not just
+// argmatch, but while a check is loading values, delve's are usually most
+// of the growth.
+func heapBytes() int64 {
+	metrics.Read(heapSample)
+	if heapSample[0].Value.Kind() != metrics.KindUint64 {
+		return 0
+	}
+	return int64(heapSample[0].Value.Uint64())
+}
+
+// heapCheckReads is how often (in reads) the heap size is checked. Reading
+// it costs about as much as half a read of /proc/self/mem; the clock is
+// checked on every read, at a tenth of that.
+const heapCheckReads = 16
+
+// start begins a check's budget: maxTime from now (0 for no limit), and
+// maxMem bytes of heap growth (0 for no limit).
+func (m *memory) start(maxTime time.Duration, maxMem int64) {
+	m.started = time.Now()
+	m.deadline = time.Time{}
+	if maxTime > 0 {
+		m.deadline = m.started.Add(maxTime)
+	}
+	m.maxHeap = maxMem
+	if maxMem > 0 {
+		m.baseHeap = heapBytes()
+	}
+	m.reads = 0
+	m.exceeded = ""
+}
+
+// stop ends the budget, so reads outside a check (there are none now)
+// aren't limited by it.
+func (m *memory) stop() {
+	m.deadline, m.maxHeap = time.Time{}, 0
+}
 
 func (m *memory) ReadMemory(buf []byte, addr uint64) (int, error) {
+	if m.exceeded != "" {
+		return 0, errBudget
+	}
+	if !m.deadline.IsZero() {
+		if now := time.Now(); now.After(m.deadline) {
+			m.exceeded = fmt.Sprintf("stopped loading at -maxtime after %v", now.Sub(m.started).Round(time.Millisecond))
+			return 0, errBudget
+		}
+	}
+	if m.maxHeap > 0 && m.reads%heapCheckReads == 0 {
+		if grown := heapBytes() - m.baseHeap; grown > m.maxHeap {
+			m.exceeded = fmt.Sprintf("stopped loading at -maxmem after the heap grew by %d MB in %v",
+				grown/1e6, time.Since(m.started).Round(time.Millisecond))
+			return 0, errBudget
+		}
+	}
+	m.reads++
 	return m.f.ReadAt(buf, int64(addr))
 }
 

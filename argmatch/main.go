@@ -63,6 +63,7 @@ var (
 	depth          = flag.Int("depth", envInt("ARGMATCH_DEPTH", 5), "how many levels of nested structs, arrays, maps and pointers-to-pointers to load (delve's MaxVariableRecurse; env ARGMATCH_DEPTH)")
 	maxCalls       = flag.Int("maxcalls", envInt("ARGMATCH_MAXCALLS", 3), "check only the first maxcalls calls of each function; later calls skip the check and cost almost nothing; 0 means no limit (env ARGMATCH_MAXCALLS)")
 	maxElems       = flag.Int("maxelems", envInt("ARGMATCH_MAXELEMS", 64), "how many elements of each array, slice and map to load (delve's MaxArrayValues); the loaded tree grows roughly as maxelems^depth, and the default was tested with Prometheus up to -depth 10 (env ARGMATCH_MAXELEMS)")
+	maxFields      = flag.Int("maxfields", envInt("ARGMATCH_MAXFIELDS", -1), "how many fields of each struct to load, in declaration order (delve's MaxStructFields); -1 loads them all, and later fields aren't searched (env ARGMATCH_MAXFIELDS)")
 	outPath        = flag.String("out", os.Getenv("ARGMATCH_OUT"), "file the program writes its matches to, overwriting it; resolved against the program's working directory (default: stderr; env ARGMATCH_OUT)")
 	rtDir          = flag.String("rtdir", os.Getenv("ARGMATCH_RTDIR"), "directory of the argmatch module (default: the directory containing this executable; env ARGMATCH_RTDIR)")
 )
@@ -254,7 +255,7 @@ func printToolID(tool string) {
 		rtFiles, err := filepath.Glob(filepath.Join(*rtDir, "rt", "*.go"))
 		check(err)
 		h := sha256.New()
-		fmt.Fprintf(h, "%q %q %t %t %d %d %d %q %t ", slices.Sorted(maps.Keys(funcs)), needles, *exact, *ignoreClosures, *depth, *maxElems, *maxCalls, *outPath, *recvOnly)
+		fmt.Fprintf(h, "%q %q %t %t %d %d %d %d %q %t ", slices.Sorted(maps.Keys(funcs)), needles, *exact, *ignoreClosures, *depth, *maxElems, *maxFields, *maxCalls, *outPath, *recvOnly)
 		for _, f := range append([]string{self, filepath.Join(*rtDir, "go.mod"), filepath.Join(*rtDir, "go.sum")}, rtFiles...) {
 			b, err := os.ReadFile(f)
 			check(err)
@@ -316,7 +317,7 @@ func compileArgs(tool string, args []string, tmp string) []string {
 			// instead, declaring it once per package.
 			edits = append(edits,
 				edit{fset.Position(f.Name.End()).Offset, `; import _ "unsafe"`},
-				edit{len(src), fmt.Sprintf("\n//go:linkname %s %s.Check\nfunc %s(*uint32, int, []string, bool, bool, int, int, string, string, []string, []interface{})\n", checkFn, rtPkg, checkFn)},
+				edit{len(src), fmt.Sprintf("\n//go:linkname %s %s.Check\nfunc %s(*uint32, int, []string, bool, bool, int, int, int, string, string, []string, []interface{})\n", checkFn, rtPkg, checkFn)},
 			)
 			declared = true
 		}
@@ -449,8 +450,8 @@ func instrument(fset *token.FileSet, fd *ast.FuncDecl, fn string, id, size int) 
 		quotedNeedles[i] = strconv.Quote(n)
 	}
 	calls := fmt.Sprintf("%s_calls_%d", checkFn, id)
-	call := fmt.Sprintf("%s(&%s, %d, []string{%s}, %t, %t, %d, %d, %q, %q, []string{%s}, []interface{}{%s});",
-		checkFn, calls, *maxCalls, strings.Join(quotedNeedles, ", "), *exact, *ignoreClosures, *depth, *maxElems, *outPath, fn, strings.Join(quoted, ", "), strings.Join(addrs, ", "))
+	call := fmt.Sprintf("%s(&%s, %d, []string{%s}, %t, %t, %d, %d, %d, %q, %q, []string{%s}, []interface{}{%s});",
+		checkFn, calls, *maxCalls, strings.Join(quotedNeedles, ", "), *exact, *ignoreClosures, *depth, *maxElems, *maxFields, *outPath, fn, strings.Join(quoted, ", "), strings.Join(addrs, ", "))
 	return append(edits,
 		edit{off(fd.Body.Lbrace) + 1, call},
 		edit{size, fmt.Sprintf("\nvar %s uint32\n", calls)},
@@ -506,7 +507,7 @@ func rtExports(tool string) []string {
 		return `"` + s + `"`
 	}
 	toolexec := strings.Join([]string{quote(self), "-func", quote(*funcName), "-stacklog", quote(*stackLog), "-match", quote(*needle),
-		"-matchfile", quote(*matchFile), "-depth", strconv.Itoa(*depth), "-maxelems", strconv.Itoa(*maxElems), "-maxcalls", strconv.Itoa(*maxCalls), "-recvonly=" + strconv.FormatBool(*recvOnly), "-exact=" + strconv.FormatBool(*exact), "-ignoreclosures=" + strconv.FormatBool(*ignoreClosures),
+		"-matchfile", quote(*matchFile), "-depth", strconv.Itoa(*depth), "-maxelems", strconv.Itoa(*maxElems), "-maxfields", strconv.Itoa(*maxFields), "-maxcalls", strconv.Itoa(*maxCalls), "-recvonly=" + strconv.FormatBool(*recvOnly), "-exact=" + strconv.FormatBool(*exact), "-ignoreclosures=" + strconv.FormatBool(*ignoreClosures),
 		"-out", quote(*outPath), "-rtdir", quote(*rtDir)}, " ")
 	tmp, err := os.MkdirTemp("", "argmatch-mod")
 	check(err)

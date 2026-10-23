@@ -55,6 +55,25 @@ func TestMaxElems(t *testing.T) {
 	}
 }
 
+// TestMaxFields checks that -maxfields limits how many struct fields are
+// loaded: with 0, the matches in in.Name and o.P.Name aren't found.
+func TestMaxFields(t *testing.T) {
+	got := runExample(t, "-func", "main.ID.F", "-match", "needle", "-maxfields", "0")
+	want := wantF
+	for _, row := range []string{
+		"needle,main.ID.F,in.Name,main.Named,main.ID3\n",
+		"needle,main.ID.F,o.P.Name,main.Outer,main.Inner,main.ID4\n",
+	} {
+		if !strings.Contains(want, row) {
+			t.Fatalf("test bug: %q not in wantF", row)
+		}
+		want = strings.Replace(want, row, "", 1)
+	}
+	if got != want {
+		t.Errorf("matches:\n%s\nwant:\n%s", got, want)
+	}
+}
+
 // TestMaxCalls checks that only the first -maxcalls calls of a function are
 // checked (3 by default, 0 for all): Repeat is called 5 times.
 func TestMaxCalls(t *testing.T) {

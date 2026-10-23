@@ -44,8 +44,9 @@ var (
 // closures on the path down to it, as CSV rows (see options.header). If
 // ignoreClosures is set, the variables captured by func values aren't
 // checked. Values are loaded depth levels deep, and only the first maxElems
-// elements of each array, slice and map; delve loads the whole tree before
-// it's walked, so the two together bound its size. names[i] is the source
+// elements of each array, slice and map and the first maxFields fields of
+// each struct (-1 for all); delve loads the whole tree before it's walked,
+// so these together bound its size. names[i] is the source
 // name of the parameter whose address is boxed in args[i]. Output goes to
 // the file outPath, which the first call overwrites, or to stderr if outPath
 // is "". Errors always go to stderr.
@@ -59,7 +60,7 @@ var (
 // package (which can't import rt) refer to this function.
 //
 //go:linkname Check
-func Check(calls *uint32, maxCalls int, needles []string, exact, ignoreClosures bool, depth, maxElems int, outPath string, fn string, names []string, args []any) {
+func Check(calls *uint32, maxCalls int, needles []string, exact, ignoreClosures bool, depth, maxElems, maxFields int, outPath string, fn string, names []string, args []any) {
 	if maxCalls > 0 {
 		// Load first, so the counter stops growing (and can't wrap)
 		// once the limit is reached. Concurrent first calls may overshoot
@@ -110,7 +111,7 @@ func Check(calls *uint32, maxCalls int, needles []string, exact, ignoreClosures 
 		MaxVariableRecurse: depth,
 		MaxStringLen:       1 << 16,
 		MaxArrayValues:     maxElems, // also bounds map entries
-		MaxStructFields:    -1,
+		MaxStructFields:    maxFields,
 	}
 	for i := range args {
 		// args[i] is an interface{} holding *T, where T is the parameter's

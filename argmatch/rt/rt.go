@@ -27,7 +27,18 @@ import (
 	"github.com/go-delve/delve/pkg/proc"
 	"github.com/go-delve/delve/pkg/proc/linutil"
 	"golang.org/x/tools/gopls/conftamer/stacklog"
+
+	"argmatch/settings"
 )
+
+// encoded is the program's run-time settings (settings.Settings.Encode),
+// set by the wrapper with the linker's -X flag, so that changing them
+// doesn't change the compiled packages.
+var encoded string
+
+// current is the settings in use, loaded by the first check (see
+// loadSettings); nil until then.
+var current atomic.Pointer[settings.Settings]
 
 var (
 	initOnce sync.Once
@@ -43,42 +54,36 @@ var (
 	owner int64 // goroutine ID holding mu, to detect re-entry
 )
 
-// Check reports every string in args that equals one of needles (or, if
-// exact is false, contains one), along with the named types, interfaces and
-// closures on the path down to it, as CSV rows (see options.header). If
-// ignoreClosures is set, the variables captured by func values aren't
-// checked. Values are loaded depth levels deep, and only the first maxElems
-// elements of each array, slice and map and the first maxFields fields of
-// each struct (-1 for all); delve loads the whole tree before it's walked,
-// so these together bound its size. Loading stops once it has taken
-// maxTime nanoseconds or the Go heap has grown by maxMem bytes (0 for no
+// Check reports every string in args that equals one of the needles (or,
+// if Exact is false, contains one), along with the named types, interfaces
+// and closures on the path down to it, as CSV rows (see options.header).
+// The settings (settings.Settings) are loaded by the first call; see
+// loadSettings. If IgnoreClosures is set, the variables captured by func
+// values aren't checked. Values are loaded Depth levels deep, and only the
+// first MaxElems elements of each array, slice and map and the first
+// MaxFields fields of each struct (-1 for all); delve loads the whole tree
+// before it's walked, so these together bound its size. Loading stops once
+// it has taken MaxTime or the Go heap has grown by MaxMem bytes (0 for no
 // limit; see memory.start), and the matches in what was loaded by then are
-// reported. The fields of the struct types that ignoreLibs and
-// ignoreTypes select aren't loaded (see ignoreFields); these are the same
-// in every call, and the first call applies them. names[i] is the source
-// name of the parameter whose address is boxed in args[i]. Output goes to
-// the file outPath, which the first call overwrites, or to stderr if outPath
-// is "". Errors always go to stderr.
+// reported. The fields of the struct types that IgnoreLibs and IgnoreTypes
+// select aren't loaded (see ignoreFields). names[i] is the source name of
+// the parameter whose address is boxed in args[i]. Output goes to the file
+// Out, which the first call overwrites, or to stderr if Out is "". Errors
+// always go to stderr.
 //
 // calls counts the calls of fn so far (each instrumented function has its
-// own counter). Once it reaches maxCalls, Check returns at once, before
+// own counter). Once it reaches MaxCalls, Check returns at once, before
 // taking the lock that serializes checks, so later calls cost almost
-// nothing. maxCalls 0 means no limit.
+// nothing. MaxCalls 0 means no limit.
 //
 // The push linkname lets the injected bodyless declaration in the target
 // package (which can't import rt) refer to this function.
 //
 //go:linkname Check
-func Check(calls *uint32, maxCalls int, needles []string, exact, ignoreClosures bool, depth, maxElems, maxFields int, maxTime, maxMem int64, ignoreLibs bool, ignoreTypes []string, outPath string, fn string, names []string, args []any) {
-	if maxCalls > 0 {
-		// Load first, so the counter stops growing (and can't wrap)
-		// once the limit is reached. Concurrent first calls may overshoot
-		// the limit slightly. Calls of fn made by delve itself while
-		// checking (if fn is in the standard library) count too.
-		if atomic.LoadUint32(calls) >= uint32(maxCalls) {
-			return
-		}
-		atomic.AddUint32(calls, 1)
+func Check(calls *uint32, fn string, names []string, args []any) {
+	s := current.Load()
+	if s != nil && !admit(calls, s) {
+		return
 	}
 	// The target function may be called by delve itself (e.g. if it's in
 	// the standard library), so ignore calls made while checking.
@@ -92,12 +97,23 @@ func Check(calls *uint32, maxCalls int, needles []string, exact, ignoreClosures 
 		owner = gid
 	}
 	defer func() { owner = 0; mu.Unlock() }()
+	if s == nil {
+		// Load the settings under the lock, so that calls made while
+		// loading them (by the standard library) are ignored as re-entry.
+		if s = current.Load(); s == nil {
+			s = loadSettings()
+			current.Store(s)
+		}
+		if !admit(calls, s) {
+			return
+		}
+	}
 
-	o := options{needles: needles, exact: exact, ignoreClosures: ignoreClosures}
+	o := options{needles: s.Needles, exact: s.Exact, ignoreClosures: s.IgnoreClosures}
 	outOnce.Do(func() {
-		if outPath != "" {
+		if s.Out != "" {
 			// Overwrite any output from an earlier run.
-			f, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+			f, err := os.OpenFile(s.Out, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "argmatch: %v; writing to stderr instead\n", err)
 			} else {
@@ -112,7 +128,7 @@ func Check(calls *uint32, maxCalls int, needles []string, exact, ignoreClosures 
 	initOnce.Do(func() {
 		load()
 		if initErr == nil {
-			ignoreFields(ignoreLibs, ignoreTypes)
+			ignoreFields(s.IgnoreLibs, s.IgnoreTypes)
 		}
 	})
 	if initErr != nil {
@@ -121,15 +137,15 @@ func Check(calls *uint32, maxCalls int, needles []string, exact, ignoreClosures 
 	}
 	// Start the budget after the lock and the one-time load of the DWARF
 	// info, so neither counts against it.
-	selfMem.start(time.Duration(maxTime), maxMem)
+	selfMem.start(s.MaxTime, s.MaxMem)
 	defer selfMem.stop()
 	scope := &proc.EvalScope{BinInfo: bi, Mem: selfMem}
 	cfg := proc.LoadConfig{
 		FollowPointers:     true,
-		MaxVariableRecurse: depth,
+		MaxVariableRecurse: s.Depth,
 		MaxStringLen:       1 << 16,
-		MaxArrayValues:     maxElems, // also bounds map entries
-		MaxStructFields:    maxFields,
+		MaxArrayValues:     s.MaxElems, // also bounds map entries
+		MaxStructFields:    s.MaxFields,
 	}
 	for i := range args {
 		if selfMem.exceeded != "" {
@@ -169,6 +185,46 @@ func Check(calls *uint32, maxCalls int, needles []string, exact, ignoreClosures 
 	if selfMem.exceeded != "" {
 		fmt.Fprintf(os.Stderr, "argmatch: %s: %s; reporting the matches in what was loaded\n", fn, selfMem.exceeded)
 	}
+}
+
+// admit counts a call in calls and reports whether it should be checked,
+// i.e. whether fewer than s.MaxCalls calls have been (0 for no limit).
+func admit(calls *uint32, s *settings.Settings) bool {
+	if s.MaxCalls <= 0 {
+		return true
+	}
+	// Load first, so the counter stops growing (and can't wrap) once the
+	// limit is reached. Concurrent first calls may overshoot the limit
+	// slightly. Calls of the function made by delve itself while checking
+	// (if it's in the standard library) count too.
+	if atomic.LoadUint32(calls) >= uint32(s.MaxCalls) {
+		return false
+	}
+	atomic.AddUint32(calls, 1)
+	return true
+}
+
+// loadSettings returns the settings the wrapper linked in (encoded),
+// overridden by any ARGMATCH_* environment variables (see
+// settings.Settings.FromEnv), and says on stderr which variables it used
+// and any it couldn't.
+func loadSettings() *settings.Settings {
+	s := settings.Default()
+	if encoded != "" {
+		var err error
+		if s, err = settings.Decode(encoded); err != nil {
+			fmt.Fprintf(os.Stderr, "argmatch: decoding the linked-in settings: %v\n", err)
+			s = settings.Default()
+		}
+	}
+	used, err := s.FromEnv()
+	if len(used) > 0 {
+		fmt.Fprintf(os.Stderr, "argmatch: settings from the environment: %s\n", strings.Join(used, ", "))
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "argmatch: ignoring %v\n", err)
+	}
+	return &s
 }
 
 // header returns the names of the output's columns. Each row has one more

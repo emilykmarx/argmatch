@@ -17,6 +17,12 @@
 // Matches are printed to the program's stderr, or written to the file
 // given by -out, overwriting it.
 //
+// Only -func, -stacklog and -recvonly change the compiled code. The other
+// settings are run-time settings (see package argmatch/settings): they're
+// passed to the linker, so changing them only relinks the program, and the
+// program can override them with ARGMATCH_* environment variables when it
+// runs.
+//
 // The wrapper never stops the program. Instead it rewrites code at compile
 // time: it compiles everything with -N -l so values are readable, injects a
 // call to argmatch/rt.Check at the top of the function, and links in
@@ -33,7 +39,6 @@ import (
 	"go/parser"
 	"go/token"
 	"maps"
-	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -44,6 +49,8 @@ import (
 	"time"
 
 	"golang.org/x/tools/gopls/conftamer/stacklog"
+
+	"argmatch/settings"
 )
 
 const (
@@ -74,15 +81,26 @@ var (
 	rtDir          = flag.String("rtdir", os.Getenv("ARGMATCH_RTDIR"), "directory of the argmatch module (default: the directory containing this executable; env ARGMATCH_RTDIR)")
 )
 
-// ignoredTypes returns the names in -ignoretypes.
-func ignoredTypes() []string {
-	var ts []string
-	for _, t := range strings.Split(*ignoreTypes, ",") {
-		if t = strings.TrimSpace(t); t != "" {
-			ts = append(ts, t)
-		}
+// runTimeSettings returns the flags that only change what the program does
+// when it runs, not which code is instrumented. They're passed to the
+// linker (see withSettings) rather than compiled into the instrumented
+// packages, so changing them doesn't recompile anything, and the program
+// can override them with environment variables.
+func runTimeSettings() settings.Settings {
+	return settings.Settings{
+		Needles:        needles,
+		Exact:          *exact,
+		IgnoreClosures: *ignoreClosures,
+		IgnoreLibs:     *ignoreLibs,
+		IgnoreTypes:    settings.SplitList(*ignoreTypes),
+		Depth:          *depth,
+		MaxElems:       *maxElems,
+		MaxFields:      *maxFields,
+		MaxCalls:       *maxCalls,
+		MaxTime:        *maxTime,
+		MaxMem:         int64(*maxMem),
+		Out:            *outPath,
 	}
-	return ts
 }
 
 // needles holds -match and the lines of -matchfile.
@@ -163,31 +181,14 @@ func loadFuncs() {
 }
 
 // loadNeedles returns -match and the lines of -matchfile that are neither
-// blank nor comments (starting with #), without duplicates. Each line is
-// used as is, apart from a trailing \r.
+// blank nor comments (starting with #), without duplicates (see
+// settings.LoadNeedles). The go command runs tools in each package's
+// directory, so -matchfile must be absolute: a relative path would mean
+// something different for each package.
 func loadNeedles() []string {
-	var ns []string
-	if *needle != "" {
-		ns = append(ns, *needle)
-	}
-	if *matchFile != "" {
-		// The go command runs tools in each package's directory, so a
-		// relative path would mean something different for each package.
-		if !filepath.IsAbs(*matchFile) {
-			fmt.Fprintf(os.Stderr, "argmatch: -matchfile %s must be an absolute path\n", *matchFile)
-			os.Exit(2)
-		}
-		data, err := os.ReadFile(*matchFile)
-		check(err)
-		for _, line := range strings.Split(string(data), "\n") {
-			line = strings.TrimSuffix(line, "\r")
-			if line != "" && !strings.HasPrefix(line, "#") && !slices.Contains(ns, line) {
-				ns = append(ns, line)
-			}
-		}
-	}
-	if len(ns) == 0 {
-		fmt.Fprintln(os.Stderr, "argmatch: no strings to match")
+	ns, err := settings.LoadNeedles(*needle, *matchFile)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "argmatch:", err)
 		os.Exit(2)
 	}
 	return ns
@@ -209,49 +210,19 @@ func envDuration(name string, def time.Duration) time.Duration {
 	return def
 }
 
-// envByteSize returns the environment variable's value as a byteSize, or
-// def if it's unset or not a size.
-func envByteSize(name string, def byteSize) byteSize {
-	var b byteSize
+// envByteSize returns the environment variable's value as a
+// settings.ByteSize, or def if it's unset or not a size.
+func envByteSize(name string, def settings.ByteSize) settings.ByteSize {
+	var b settings.ByteSize
 	if err := b.Set(os.Getenv(name)); err == nil {
 		return b
 	}
 	return def
 }
 
-// byteSize is a number of bytes, written as a plain number or with a unit:
-// KB, MB, GB (powers of 1000) or KiB, MiB, GiB (powers of 1024).
-type byteSize int64
-
-var byteUnits = []struct {
-	suffix string
-	size   int64
-}{
-	{"KiB", 1 << 10}, {"MiB", 1 << 20}, {"GiB", 1 << 30},
-	{"KB", 1e3}, {"MB", 1e6}, {"GB", 1e9}, {"B", 1},
-}
-
-func (b *byteSize) Set(s string) error {
-	mult := int64(1)
-	for _, u := range byteUnits {
-		if t, ok := strings.CutSuffix(s, u.suffix); ok {
-			s, mult = strings.TrimSpace(t), u.size
-			break
-		}
-	}
-	n, err := strconv.ParseInt(s, 10, 64)
-	if err != nil || n < 0 || n > math.MaxInt64/mult {
-		return fmt.Errorf("invalid size %q", s)
-	}
-	*b = byteSize(n * mult)
-	return nil
-}
-
-func (b *byteSize) String() string { return strconv.FormatInt(int64(*b), 10) }
-
-// byteSizeFlag defines a byteSize flag.
-func byteSizeFlag(name string, def byteSize, usage string) *byteSize {
-	b := new(byteSize)
+// byteSizeFlag defines a settings.ByteSize flag.
+func byteSizeFlag(name string, def settings.ByteSize, usage string) *settings.ByteSize {
+	b := new(settings.ByteSize)
 	*b = def
 	flag.Var(b, name, usage)
 	return b
@@ -292,12 +263,12 @@ func main() {
 	}
 	tmp, err := os.MkdirTemp("", "argmatch")
 	check(err)
-	switch strings.TrimSuffix(filepath.Base(tool), ".exe") {
-	case "compile":
+	switch {
+	case isTool(tool, "compile"):
 		args = compileArgs(tool, args, tmp)
-	case "link":
+	case isTool(tool, "link"):
 		if os.Getenv(nestedEnv) == "" {
-			args = withRT(tool, args, tmp)
+			args = withSettings(withRT(tool, args, tmp), tmp)
 		}
 	}
 	cmd := exec.Command(tool, args...)
@@ -316,7 +287,10 @@ func main() {
 // appended, so that the go command caches our instrumented, unoptimized
 // builds separately from normal ones and from other settings. The go
 // command doesn't know about the injected dependency on rt, so rt's
-// sources and module files are included too.
+// sources and module files are included too. Only the linker's version
+// includes the run-time settings, since only the link uses them (see
+// withSettings): changing them relinks the program but reuses the compiled
+// packages.
 func printToolID(tool string) {
 	out, err := exec.Command(tool, "-V=full").Output()
 	check(err)
@@ -328,8 +302,14 @@ func printToolID(tool string) {
 		check(err)
 		rtFiles, err := filepath.Glob(filepath.Join(*rtDir, "rt", "*.go"))
 		check(err)
+		settingsFiles, err := filepath.Glob(filepath.Join(*rtDir, "settings", "*.go"))
+		check(err)
+		rtFiles = append(rtFiles, settingsFiles...)
 		h := sha256.New()
-		fmt.Fprintf(h, "%q %q %t %t %d %d %d %d %d %d %t %q %q %t ", slices.Sorted(maps.Keys(funcs)), needles, *exact, *ignoreClosures, *depth, *maxElems, *maxFields, *maxTime, *maxMem, *maxCalls, *ignoreLibs, ignoredTypes(), *outPath, *recvOnly)
+		fmt.Fprintf(h, "%q %t ", slices.Sorted(maps.Keys(funcs)), *recvOnly)
+		if isTool(tool, "link") {
+			fmt.Fprintf(h, "%s ", runTimeSettings().Encode())
+		}
 		for _, f := range append([]string{self, filepath.Join(*rtDir, "go.mod"), filepath.Join(*rtDir, "go.sum")}, rtFiles...) {
 			b, err := os.ReadFile(f)
 			check(err)
@@ -338,6 +318,21 @@ func printToolID(tool string) {
 		line += fmt.Sprintf(" argmatch=%x", h.Sum(nil)[:8])
 	}
 	fmt.Println(line)
+}
+
+// isTool reports whether tool is the path of the go tool name (e.g. compile).
+func isTool(tool, name string) bool {
+	return strings.TrimSuffix(filepath.Base(tool), ".exe") == name
+}
+
+// withSettings adds the run-time settings to the linker's args in a
+// response file, setting rt's encoded variable with -X. A response file
+// avoids the limit on one argument's length (128 KiB on Linux), which a
+// large -matchfile could exceed.
+func withSettings(args []string, tmp string) []string {
+	rsp := filepath.Join(tmp, "settings.rsp")
+	check(os.WriteFile(rsp, []byte("-X\n"+rtPkg+".encoded="+runTimeSettings().Encode()+"\n"), 0o644))
+	return append([]string{"@" + rsp}, args...)
 }
 
 // compileArgs disables optimizations, injects the call to rt.Check if the
@@ -391,7 +386,7 @@ func compileArgs(tool string, args []string, tmp string) []string {
 			// instead, declaring it once per package.
 			edits = append(edits,
 				edit{fset.Position(f.Name.End()).Offset, `; import _ "unsafe"`},
-				edit{len(src), fmt.Sprintf("\n//go:linkname %s %s.Check\nfunc %s(*uint32, int, []string, bool, bool, int, int, int, int64, int64, bool, []string, string, string, []string, []interface{})\n", checkFn, rtPkg, checkFn)},
+				edit{len(src), fmt.Sprintf("\n//go:linkname %s %s.Check\nfunc %s(*uint32, string, []string, []interface{})\n", checkFn, rtPkg, checkFn)},
 			)
 			declared = true
 		}
@@ -519,17 +514,9 @@ func instrument(fset *token.FileSet, fd *ast.FuncDecl, fn string, id, size int) 
 	for i, n := range names {
 		quoted[i] = strconv.Quote(n)
 	}
-	quotedNeedles := make([]string, len(needles))
-	for i, n := range needles {
-		quotedNeedles[i] = strconv.Quote(n)
-	}
 	calls := fmt.Sprintf("%s_calls_%d", checkFn, id)
-	var quotedTypes []string
-	for _, t := range ignoredTypes() {
-		quotedTypes = append(quotedTypes, strconv.Quote(t))
-	}
-	call := fmt.Sprintf("%s(&%s, %d, []string{%s}, %t, %t, %d, %d, %d, %d, %d, %t, []string{%s}, %q, %q, []string{%s}, []interface{}{%s});",
-		checkFn, calls, *maxCalls, strings.Join(quotedNeedles, ", "), *exact, *ignoreClosures, *depth, *maxElems, *maxFields, int64(*maxTime), int64(*maxMem), *ignoreLibs, strings.Join(quotedTypes, ", "), *outPath, fn, strings.Join(quoted, ", "), strings.Join(addrs, ", "))
+	call := fmt.Sprintf("%s(&%s, %q, []string{%s}, []interface{}{%s});",
+		checkFn, calls, fn, strings.Join(quoted, ", "), strings.Join(addrs, ", "))
 	return append(edits,
 		edit{off(fd.Body.Lbrace) + 1, call},
 		edit{size, fmt.Sprintf("\nvar %s uint32\n", calls)},

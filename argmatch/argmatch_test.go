@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -8,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 // header is the output's header with the default -exact and
@@ -107,22 +109,57 @@ func TestMaxMem(t *testing.T) {
 	}
 }
 
-// TestByteSize checks how -maxmem sizes are parsed.
-func TestByteSize(t *testing.T) {
-	for s, want := range map[string]int64{
-		"0": 0, "123": 123, "2KB": 2000, "512MB": 512e6, "1GB": 1e9,
-		"1KiB": 1024, "3MiB": 3 << 20, "2GiB": 2 << 30, "7B": 7, "1 GiB": 1 << 30,
-	} {
-		var b byteSize
-		if err := b.Set(s); err != nil || int64(b) != want {
-			t.Errorf("Set(%q) = %d, %v; want %d", s, b, err, want)
+// TestEnvOverride checks that ARGMATCH_* environment variables override
+// the run-time settings when the program runs, without a rebuild, and that
+// the program says which ones it used.
+func TestEnvOverride(t *testing.T) {
+	e := buildExample(t, "-func", "main.ID.F", "-match", "needle")
+	if got, stderr := e.run(t); got != wantF || stderr != "" {
+		t.Fatalf("matches:\n%s\nstderr:\n%s\nwant:\n%s", got, stderr, wantF)
+	}
+	got, stderr := e.run(t, "ARGMATCH_MATCH=eedl", "ARGMATCH_EXACT=false", "ARGMATCH_MAXELEMS=0")
+	want := "needle,haystack,function,expression,types\n" +
+		"eedl,needle,main.ID.F,id_recvr,main.ID\n" +
+		"eedl,needle,main.ID.F,id_arg,main.ID2\n" +
+		"eedl,needle,main.ID.F,in.Name,main.Named,main.ID3\n" +
+		"eedl,needle,main.ID.F,o.P.Name,main.Outer,main.Inner,main.ID4\n" +
+		"eedl,needle,main.ID.F,i,main.ID5 (implements main.Iface)\n"
+	if got != want {
+		t.Errorf("with environment: matches:\n%s\nwant:\n%s", got, want)
+	}
+	if w := "argmatch: settings from the environment: ARGMATCH_MATCH, ARGMATCH_EXACT, ARGMATCH_MAXELEMS\n"; stderr != w {
+		t.Errorf("with environment: stderr %q, want %q", stderr, w)
+	}
+}
+
+// TestRunTimeFlagsDontRecompile checks that changing only run-time flags
+// relinks the program without recompiling any package, and that the new
+// values take effect.
+func TestRunTimeFlagsDontRecompile(t *testing.T) {
+	e := buildExample(t, "-func", "main.ID.F", "-match", "needle")
+	stderr := e.goBuild(t, []string{"-x"}, "-func", "main.ID.F", "-match", "eedl", "-exact=false", "-maxelems", "0", "-depth", "7")
+	var compiles, links int
+	for _, line := range strings.Split(stderr, "\n") {
+		switch {
+		case strings.Contains(line, "/compile ") || strings.Contains(line, "/compile\""):
+			compiles++
+		case strings.Contains(line, "/link ") || strings.Contains(line, "/link\""):
+			links++
 		}
 	}
-	for _, s := range []string{"", "x", "-1", "1TB", "1.5GB", "99999999999GiB"} {
-		var b byteSize
-		if err := b.Set(s); err == nil {
-			t.Errorf("Set(%q) = %d, want an error", s, b)
-		}
+	if compiles != 0 || links != 1 {
+		t.Errorf("rebuild ran %d compiles and %d links, want 0 and 1", compiles, links)
+	}
+	if got, _ := e.run(t); !strings.HasPrefix(got, "needle,haystack,function,expression,types\needl,needle,") {
+		t.Errorf("after rebuild: matches:\n%s\nwant eedl rows", got)
+	}
+	// Changing which functions are instrumented does recompile. The
+	// function needn't exist; a name not used before keeps the build cache
+	// from having the result already.
+	fn := fmt.Sprintf("main.NotThere%d", time.Now().UnixNano())
+	stderr = e.goBuild(t, []string{"-x"}, "-func", fn, "-match", "needle")
+	if !strings.Contains(stderr, "/compile") {
+		t.Error("changing -func didn't recompile")
 	}
 }
 
@@ -281,6 +318,20 @@ func runExample(t *testing.T, flags ...string) string {
 // too.
 func runExampleStderr(t *testing.T, flags ...string) (matches, stderr string) {
 	t.Helper()
+	e := buildExample(t, flags...)
+	return e.run(t)
+}
+
+// example is testdata/example built under argmatch.
+type example struct {
+	tmp, wrapper, rtDir string
+	exe, out            string // the program and the file it writes matches to
+}
+
+// buildExample builds the wrapper and then testdata/example under it with
+// the given wrapper flags.
+func buildExample(t *testing.T, flags ...string) *example {
+	t.Helper()
 	if runtime.GOOS != "linux" {
 		t.Skip("rt reads /proc/self")
 	}
@@ -292,23 +343,52 @@ func runExampleStderr(t *testing.T, flags ...string) (matches, stderr string) {
 		t.Fatal(err)
 	}
 	tmp := t.TempDir()
-	wrapper := filepath.Join(tmp, "argmatch")
-	run(t, rtDir, "go", "build", "-o", wrapper, ".")
+	e := &example{tmp: tmp, wrapper: filepath.Join(tmp, "argmatch"), rtDir: rtDir,
+		exe: filepath.Join(tmp, "example"), out: filepath.Join(tmp, "out.txt")}
+	run(t, rtDir, "go", "build", "-o", e.wrapper, ".")
+	e.build(t, flags...)
+	return e
+}
 
-	out := filepath.Join(tmp, "out.txt")
-	toolexec := strings.Join(append([]string{`"` + wrapper + `"`,
-		"-out", `"` + out + `"`, "-rtdir", `"` + rtDir + `"`}, flags...), " ")
-	example := filepath.Join(tmp, "example")
-	run(t, filepath.Join(rtDir, "testdata", "example"), "go", "build", "-toolexec", toolexec, "-o", example, ".")
-	got, stderr := runStderr(t, tmp, example)
-	if got != "done\n" {
+// build (re)builds the example under the wrapper with the given flags, and
+// returns the go command's stderr.
+func (e *example) build(t *testing.T, flags ...string) string {
+	t.Helper()
+	return e.goBuild(t, nil, flags...)
+}
+
+// goBuild runs go build under the wrapper with the given go build flags
+// (e.g. -x) and wrapper flags, and returns the go command's stderr.
+func (e *example) goBuild(t *testing.T, goFlags []string, flags ...string) string {
+	t.Helper()
+	toolexec := strings.Join(append([]string{`"` + e.wrapper + `"`,
+		"-out", `"` + e.out + `"`, "-rtdir", `"` + e.rtDir + `"`}, flags...), " ")
+	args := append(append([]string{"build", "-toolexec", toolexec}, goFlags...), "-o", e.exe, ".")
+	_, stderr := runStderr(t, filepath.Join(e.rtDir, "testdata", "example"), "go", args...)
+	return stderr
+}
+
+// run runs the example, with env added to its environment, and returns
+// the matches it wrote and its stderr.
+func (e *example) run(t *testing.T, env ...string) (matches, stderr string) {
+	t.Helper()
+	cmd := exec.Command(e.exe)
+	cmd.Dir = e.tmp
+	cmd.Env = append(os.Environ(), env...)
+	var errb strings.Builder
+	cmd.Stderr = &errb
+	got, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("%s: %v\n%s", e.exe, err, errb.String())
+	}
+	if string(got) != "done\n" {
 		t.Errorf("example printed %q, want %q", got, "done\n")
 	}
-	data, err := os.ReadFile(out)
+	data, err := os.ReadFile(e.out)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return string(data), stderr
+	return string(data), errb.String()
 }
 
 // run runs a command in dir and returns its stdout, failing the test if

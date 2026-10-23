@@ -9,9 +9,10 @@ compared whole, except that map positions in the expression column are
 ignored (see below).
 
 The output is grouped by needle, and the groups are ordered by how many
-distinct haystacks the needle matched, fewest first (ties by needle). Within a
-group, rows are sorted by haystack; rows with the same needle and haystack stay
-in the order in which they first appear.
+distinct haystacks the needle matched, fewest first, then by the needle's
+length, longest first (remaining ties by needle). Within a group, rows are
+sorted by haystack; rows with the same needle and haystack stay in the order
+in which they first appear.
 
 Columns are found by name in the header, since argmatch leaves some out: with
 exact matching there's no haystack column (every haystack is its needle, so
@@ -66,6 +67,9 @@ def _unused_char(text):
 
 def read_csv(data):
     """Return the rows of CSV data (bytes)."""
+    # Fields can be longer than the csv module's default limit (128 KiB),
+    # e.g. needle_types.py's list of expressions.
+    csv.field_size_limit(len(data) + 1)
     text = data.decode("utf-8", "surrogateescape")
     nul = _unused_char(text)
     rows = csv.reader(io.StringIO(text.replace("\0", nul), newline=""))
@@ -110,7 +114,7 @@ def main():
     for row in unique:
         haystacks.setdefault(row[needle], set()).add(row[haystack])
     # sort is stable, so ties keep their first-appearance order.
-    unique.sort(key=lambda row: (len(haystacks[row[needle]]), row[needle], row[haystack]))
+    unique.sort(key=lambda row: (len(haystacks[row[needle]]), -len(row[needle]), row[needle], row[haystack]))
     write_csv([header] + unique, sys.stdout.buffer)
 
 

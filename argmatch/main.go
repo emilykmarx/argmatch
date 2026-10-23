@@ -66,11 +66,24 @@ var (
 	maxCalls       = flag.Int("maxcalls", envInt("ARGMATCH_MAXCALLS", 3), "check only the first maxcalls calls of each function; later calls skip the check and cost almost nothing; 0 means no limit (env ARGMATCH_MAXCALLS)")
 	maxElems       = flag.Int("maxelems", envInt("ARGMATCH_MAXELEMS", 64), "how many elements of each array, slice and map to load (delve's MaxArrayValues); the loaded tree grows roughly as maxelems^depth, and the default was tested with Prometheus up to -depth 10 (env ARGMATCH_MAXELEMS)")
 	maxFields      = flag.Int("maxfields", envInt("ARGMATCH_MAXFIELDS", -1), "how many fields of each struct to load, in declaration order (delve's MaxStructFields); -1 loads them all, and later fields aren't searched (env ARGMATCH_MAXFIELDS)")
+	ignoreLibs     = flag.Bool("ignorelibs", envBool("ARGMATCH_IGNORELIBS", true), "don't load the fields of struct types in packages that stacklog.IgnoreFn ignores (the standard library, gRPC, golang.org/x/net, ...), except runtime and internal packages, which delve needs; values of those types are still checked themselves (env ARGMATCH_IGNORELIBS)")
+	ignoreTypes    = flag.String("ignoretypes", os.Getenv("ARGMATCH_IGNORETYPES"), "comma-separated struct types whose fields aren't loaded, each a full name (github.com/prometheus/prometheus/config.Config) or its end after a slash (config.Config) (env ARGMATCH_IGNORETYPES)")
 	maxTime        = flag.Duration("maxtime", envDuration("ARGMATCH_MAXTIME", 0), "stop loading a call's values after this long (e.g. 10s), and report the matches found in what was loaded; 0 means no limit (env ARGMATCH_MAXTIME)")
 	maxMem         = byteSizeFlag("maxmem", envByteSize("ARGMATCH_MAXMEM", 0), "stop loading a call's values once the Go heap has grown by this much (e.g. 512MB, 2GiB, or bytes), and report the matches found in what was loaded; 0 means no limit (env ARGMATCH_MAXMEM)")
 	outPath        = flag.String("out", os.Getenv("ARGMATCH_OUT"), "file the program writes its matches to, overwriting it; resolved against the program's working directory (default: stderr; env ARGMATCH_OUT)")
 	rtDir          = flag.String("rtdir", os.Getenv("ARGMATCH_RTDIR"), "directory of the argmatch module (default: the directory containing this executable; env ARGMATCH_RTDIR)")
 )
+
+// ignoredTypes returns the names in -ignoretypes.
+func ignoredTypes() []string {
+	var ts []string
+	for _, t := range strings.Split(*ignoreTypes, ",") {
+		if t = strings.TrimSpace(t); t != "" {
+			ts = append(ts, t)
+		}
+	}
+	return ts
+}
 
 // needles holds -match and the lines of -matchfile.
 var needles []string
@@ -316,7 +329,7 @@ func printToolID(tool string) {
 		rtFiles, err := filepath.Glob(filepath.Join(*rtDir, "rt", "*.go"))
 		check(err)
 		h := sha256.New()
-		fmt.Fprintf(h, "%q %q %t %t %d %d %d %d %d %d %q %t ", slices.Sorted(maps.Keys(funcs)), needles, *exact, *ignoreClosures, *depth, *maxElems, *maxFields, *maxTime, *maxMem, *maxCalls, *outPath, *recvOnly)
+		fmt.Fprintf(h, "%q %q %t %t %d %d %d %d %d %d %t %q %q %t ", slices.Sorted(maps.Keys(funcs)), needles, *exact, *ignoreClosures, *depth, *maxElems, *maxFields, *maxTime, *maxMem, *maxCalls, *ignoreLibs, ignoredTypes(), *outPath, *recvOnly)
 		for _, f := range append([]string{self, filepath.Join(*rtDir, "go.mod"), filepath.Join(*rtDir, "go.sum")}, rtFiles...) {
 			b, err := os.ReadFile(f)
 			check(err)
@@ -378,7 +391,7 @@ func compileArgs(tool string, args []string, tmp string) []string {
 			// instead, declaring it once per package.
 			edits = append(edits,
 				edit{fset.Position(f.Name.End()).Offset, `; import _ "unsafe"`},
-				edit{len(src), fmt.Sprintf("\n//go:linkname %s %s.Check\nfunc %s(*uint32, int, []string, bool, bool, int, int, int, int64, int64, string, string, []string, []interface{})\n", checkFn, rtPkg, checkFn)},
+				edit{len(src), fmt.Sprintf("\n//go:linkname %s %s.Check\nfunc %s(*uint32, int, []string, bool, bool, int, int, int, int64, int64, bool, []string, string, string, []string, []interface{})\n", checkFn, rtPkg, checkFn)},
 			)
 			declared = true
 		}
@@ -511,8 +524,12 @@ func instrument(fset *token.FileSet, fd *ast.FuncDecl, fn string, id, size int) 
 		quotedNeedles[i] = strconv.Quote(n)
 	}
 	calls := fmt.Sprintf("%s_calls_%d", checkFn, id)
-	call := fmt.Sprintf("%s(&%s, %d, []string{%s}, %t, %t, %d, %d, %d, %d, %d, %q, %q, []string{%s}, []interface{}{%s});",
-		checkFn, calls, *maxCalls, strings.Join(quotedNeedles, ", "), *exact, *ignoreClosures, *depth, *maxElems, *maxFields, int64(*maxTime), int64(*maxMem), *outPath, fn, strings.Join(quoted, ", "), strings.Join(addrs, ", "))
+	var quotedTypes []string
+	for _, t := range ignoredTypes() {
+		quotedTypes = append(quotedTypes, strconv.Quote(t))
+	}
+	call := fmt.Sprintf("%s(&%s, %d, []string{%s}, %t, %t, %d, %d, %d, %d, %d, %t, []string{%s}, %q, %q, []string{%s}, []interface{}{%s});",
+		checkFn, calls, *maxCalls, strings.Join(quotedNeedles, ", "), *exact, *ignoreClosures, *depth, *maxElems, *maxFields, int64(*maxTime), int64(*maxMem), *ignoreLibs, strings.Join(quotedTypes, ", "), *outPath, fn, strings.Join(quoted, ", "), strings.Join(addrs, ", "))
 	return append(edits,
 		edit{off(fd.Body.Lbrace) + 1, call},
 		edit{size, fmt.Sprintf("\nvar %s uint32\n", calls)},
@@ -569,6 +586,7 @@ func rtExports(tool string) []string {
 	}
 	toolexec := strings.Join([]string{quote(self), "-func", quote(*funcName), "-stacklog", quote(*stackLog), "-match", quote(*needle),
 		"-matchfile", quote(*matchFile), "-depth", strconv.Itoa(*depth), "-maxelems", strconv.Itoa(*maxElems), "-maxfields", strconv.Itoa(*maxFields), "-maxtime", maxTime.String(), "-maxmem", maxMem.String(), "-maxcalls", strconv.Itoa(*maxCalls), "-recvonly=" + strconv.FormatBool(*recvOnly), "-exact=" + strconv.FormatBool(*exact), "-ignoreclosures=" + strconv.FormatBool(*ignoreClosures),
+		"-ignorelibs=" + strconv.FormatBool(*ignoreLibs), "-ignoretypes", quote(*ignoreTypes),
 		"-out", quote(*outPath), "-rtdir", quote(*rtDir)}, " ")
 	tmp, err := os.MkdirTemp("", "argmatch-mod")
 	check(err)

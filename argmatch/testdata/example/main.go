@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 )
 
 type ID string
@@ -70,6 +71,9 @@ type Reloader struct {
 // Closure capturing a basic string
 func G(r Reloader, named func(), basic func()) {}
 
+// A standard library struct => struct, unless -ignorelibs
+func Lib(u *url.URL) {}
+
 // Called several times, for -maxcalls
 func Repeat(in Named) {}
 
@@ -83,6 +87,7 @@ func main() {
 	id.F(ID2(needle), hier, []string{needle}, named, &out, ID5(needle))
 	h := &Handler{Path: ID(needle)}
 	G(Reloader{Name: "r", Fn: h.Apply}, func() { _ = named }, func() { _ = needle })
+	Lib(&url.URL{Host: needle})
 	for range 5 {
 		Repeat(named)
 	}

@@ -26,6 +26,7 @@ import (
 	"github.com/go-delve/delve/pkg/dwarf/godwarf"
 	"github.com/go-delve/delve/pkg/proc"
 	"github.com/go-delve/delve/pkg/proc/linutil"
+	"golang.org/x/tools/gopls/conftamer/stacklog"
 )
 
 var (
@@ -52,7 +53,9 @@ var (
 // so these together bound its size. Loading stops once it has taken
 // maxTime nanoseconds or the Go heap has grown by maxMem bytes (0 for no
 // limit; see memory.start), and the matches in what was loaded by then are
-// reported. names[i] is the source
+// reported. The fields of the struct types that ignoreLibs and
+// ignoreTypes select aren't loaded (see ignoreFields); these are the same
+// in every call, and the first call applies them. names[i] is the source
 // name of the parameter whose address is boxed in args[i]. Output goes to
 // the file outPath, which the first call overwrites, or to stderr if outPath
 // is "". Errors always go to stderr.
@@ -66,7 +69,7 @@ var (
 // package (which can't import rt) refer to this function.
 //
 //go:linkname Check
-func Check(calls *uint32, maxCalls int, needles []string, exact, ignoreClosures bool, depth, maxElems, maxFields int, maxTime, maxMem int64, outPath string, fn string, names []string, args []any) {
+func Check(calls *uint32, maxCalls int, needles []string, exact, ignoreClosures bool, depth, maxElems, maxFields int, maxTime, maxMem int64, ignoreLibs bool, ignoreTypes []string, outPath string, fn string, names []string, args []any) {
 	if maxCalls > 0 {
 		// Load first, so the counter stops growing (and can't wrap)
 		// once the limit is reached. Concurrent first calls may overshoot
@@ -106,7 +109,12 @@ func Check(calls *uint32, maxCalls int, needles []string, exact, ignoreClosures 
 		csvOut.Flush()
 	})
 	defer csvOut.Flush()
-	initOnce.Do(load)
+	initOnce.Do(func() {
+		load()
+		if initErr == nil {
+			ignoreFields(ignoreLibs, ignoreTypes)
+		}
+	})
 	if initErr != nil {
 		fmt.Fprintf(os.Stderr, "argmatch: %v\n", initErr)
 		return
@@ -388,6 +396,67 @@ func isNamed(t string) bool {
 		}
 	}
 	return true
+}
+
+// ignoreFields makes delve load the struct types selected by ignoreLibs
+// and ignoreTypes without their fields, by emptying the field lists of the
+// types in delve's type cache, which every later load reads them from.
+// Values of those types are still checked (a struct has nothing to check
+// by itself), but nothing inside them is loaded or searched, however deep
+// -depth goes. Only struct types are affected: a named map, slice or
+// pointer type in an ignored package still loads its elements.
+//
+// With ignoreLibs, a type is ignored if stacklog.IgnoreFn would ignore a
+// function of the same name: it's in the standard library or one of
+// stacklog.IGNORE_LIBS. Each entry of ignoreTypes is a full type name or
+// its end after a slash (config.Config for
+// github.com/prometheus/prometheus/config.Config). Neither ever ignores
+// the runtime and internal packages' types, whose fields delve reads
+// itself (e.g. to iterate over maps and find interfaces' dynamic types).
+func ignoreFields(ignoreLibs bool, ignoreTypes []string) {
+	if !ignoreLibs && len(ignoreTypes) == 0 {
+		return
+	}
+	names, _ := bi.Types()
+	for _, name := range names {
+		if !isNamed(name) {
+			continue
+		}
+		// A generic type's arguments may contain slashes and dots too.
+		base, _, _ := strings.Cut(name, "[")
+		pkg := stacklog.Pkg(base)
+		if pkg == "runtime" || strings.HasPrefix(pkg, "runtime/") || strings.HasPrefix(pkg, "internal/") || synthetic(name, pkg) {
+			continue
+		}
+		ignore := ignoreLibs && stacklog.IgnoreFn(base, isStdPkg)
+		for _, t := range ignoreTypes {
+			ignore = ignore || name == t || base == t || strings.HasSuffix(name, "/"+t) || strings.HasSuffix(base, "/"+t)
+		}
+		if !ignore {
+			continue
+		}
+		if st, err := bi.FindType(name); err == nil {
+			if st, ok := st.(*godwarf.StructType); ok {
+				st.Field = nil
+			}
+		}
+	}
+}
+
+// synthetic reports whether name, in package pkg, is a type the compiler
+// made up rather than one declared in a package, e.g. map internals such as
+// groupReference<string,int> and hchan<int>, which delve reads itself, or
+// noalg.struct { ... } and go.shape.int.
+func synthetic(name, pkg string) bool {
+	return pkg == "" || strings.Contains(name, "<") || strings.HasPrefix(name, "noalg.") || strings.HasPrefix(name, "go.")
+}
+
+// isStdPkg reports whether pkg is in the standard library, using the go
+// command's rule: the first element of the path has no dot. main is the
+// exception.
+func isStdPkg(pkg string) bool {
+	first, _, _ := strings.Cut(pkg, "/")
+	return pkg != "main" && !strings.Contains(first, ".")
 }
 
 func load() {

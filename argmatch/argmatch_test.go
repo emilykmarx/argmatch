@@ -126,6 +126,34 @@ func TestByteSize(t *testing.T) {
 	}
 }
 
+// TestIgnoreLibs checks that by default the fields of standard library
+// structs aren't loaded: Lib's only match is in a url.URL's field.
+func TestIgnoreLibs(t *testing.T) {
+	if got := runExample(t, "-func", "main.Lib", "-match", "needle"); got != header {
+		t.Errorf("matches:\n%s\nwant only the header", got)
+	}
+	got := runExample(t, "-func", "main.Lib", "-match", "needle", "-ignorelibs=false")
+	if want := header + "needle,main.Lib,u.Host,net/url.URL\n"; got != want {
+		t.Errorf("-ignorelibs=false: matches:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// TestIgnoreTypes checks that the fields of -ignoretypes structs aren't
+// loaded, whether given by full name or by the end after a slash.
+func TestIgnoreTypes(t *testing.T) {
+	got := runExample(t, "-func", "main.ID.F", "-match", "needle", "-ignoretypes", "main.Outer")
+	want := strings.Replace(wantF, "needle,main.ID.F,o.P.Name,main.Outer,main.Inner,main.ID4\n", "", 1)
+	if want == wantF {
+		t.Fatal("test bug: o.P.Name row not in wantF")
+	}
+	if got != want {
+		t.Errorf("-ignoretypes main.Outer: matches:\n%s\nwant:\n%s", got, want)
+	}
+	if got := runExample(t, "-func", "main.Lib", "-match", "needle", "-ignorelibs=false", "-ignoretypes", "main.Outer,url.URL"); got != header {
+		t.Errorf("-ignoretypes url.URL: matches:\n%s\nwant only the header", got)
+	}
+}
+
 // TestMaxCalls checks that only the first -maxcalls calls of a function are
 // checked (3 by default, 0 for all): Repeat is called 5 times.
 func TestMaxCalls(t *testing.T) {

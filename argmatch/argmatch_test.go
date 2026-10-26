@@ -216,3 +216,47 @@ func run(t *testing.T, dir, name string, args ...string) string {
 	}
 	return string(out)
 }
+
+// TestRawMaps checks that the raw walker (PROTOTYPE) decodes maps the way
+// the reflect walker reads them: small maps, maps big enough for tables,
+// indirect (over 128-byte) keys and values, basic and struct keys, nested
+// maps and a map in an interface. All entries fit in -maxelems, so both
+// walkers report the same rows, in different orders.
+func TestRawMaps(t *testing.T) {
+	if testing.Short() {
+		t.Skip("rebuilds the standard library under argmatch")
+	}
+	rtDir, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmp := t.TempDir()
+	wrapper := filepath.Join(tmp, "argmatch")
+	run(t, rtDir, "go", "build", "-o", wrapper, ".")
+	out := filepath.Join(tmp, "out.txt")
+	toolexec := strings.Join([]string{`"` + wrapper + `"`, "-out", `"` + out + `"`, "-rtdir", `"` + rtDir + `"`,
+		"-func", "main.(*Holder).F", "-match", "needle", "-maxelems", "100", "-depth", "10"}, " ")
+	prog := filepath.Join(tmp, "maps")
+	run(t, filepath.Join(rtDir, "testdata", "maps"), "go", "build", "-toolexec", toolexec, "-o", prog, ".")
+	rows := func(walker string) []string {
+		cmd := exec.Command(prog)
+		cmd.Env = append(os.Environ(), "ARGMATCH_WALKER="+walker)
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("%s with ARGMATCH_WALKER=%s: %v", prog, walker, err)
+		}
+		data, err := os.ReadFile(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+		slices.Sort(lines)
+		return lines
+	}
+	raw, refl := rows("raw"), rows("reflect")
+	if !slices.Equal(raw, refl) {
+		t.Errorf("raw walker:\n%s\nreflect walker:\n%s", strings.Join(raw, "\n"), strings.Join(refl, "\n"))
+	}
+	if len(raw) != 10 { // header and one row per map
+		t.Errorf("raw walker reported %d lines, want 10:\n%s", len(raw), strings.Join(raw, "\n"))
+	}
+}

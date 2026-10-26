@@ -5,8 +5,8 @@ package rt
 // value that's being written gives a read error or wrong bytes, never a
 // crash, and decodes them using reflect only for type layout (sizes, field
 // offsets, element types), which comes from the binary's read-only type
-// descriptors. Maps aren't walked yet: they'd need a decoder for the
-// runtime's map layout (e.g. adapted from delve's pkg/proc/mapiter.go).
+// descriptors. Maps are decoded from the runtime's map layout (see
+// walkMap), as delve does.
 
 import (
 	"bufio"
@@ -86,6 +86,7 @@ func rawInit() {
 type rawWalker struct {
 	*walker
 	reads, bytes, readErrs, maps, badTypes int
+	badMaps                                int // maps not walked: unknown layout or bad header
 }
 
 // read returns size bytes at addr, or nil if they can't be read.
@@ -219,7 +220,7 @@ func (w *rawWalker) walkValue(t reflect.Type, b []byte, level int) {
 		}
 	case reflect.Map:
 		if level <= w.depth && word(b) != 0 {
-			w.maps++ // not walked yet
+			w.walkMap(t, word(b), level)
 		}
 	case reflect.Array:
 		e := t.Elem()
@@ -245,6 +246,175 @@ func (w *rawWalker) walkValue(t reflect.Type, b []byte, level int) {
 			w.walk(e, elems[off:off+e.Size()], level+1)
 		}
 	}
+}
+
+// mapType mirrors internal/abi.MapType, the type descriptor of a map type
+// (Go 1.24 and later), which is in the binary's read-only data.
+type mapType struct {
+	typ                          [48]byte // abi.Type
+	key, elem, group, hasher     uintptr
+	groupSize, slotSize, elemOff uintptr
+	flags                        uint32
+}
+
+// Map layout constants from internal/abi and internal/runtime/maps.
+const (
+	mapIndirectKey  = 1 << 2 // abi.MapIndirectKey: slots hold *key
+	mapIndirectElem = 1 << 3 // abi.MapIndirectElem: slots hold *elem
+	groupSlots      = 8      // abi.MapGroupSlots
+	slotsOffset     = 8      // maps.groupSlotsOffset: slots follow the 8 control bytes
+	ctrlEmpty       = 0x80   // a control byte with the top bit set is an empty or deleted slot
+	mapHeaderSize   = 32     // maps.Map up to and including dirLen
+	tableSize       = 32     // maps.table up to and including groups
+	maxDirLen       = 1 << 16
+	maxGroups       = 1 << 20
+)
+
+// typePtr returns the address of t's type descriptor.
+func typePtr(t reflect.Type) uintptr { return (*[2]uintptr)(unsafe.Pointer(&t))[1] }
+
+// mapTypeOf returns the descriptor of map type t, if its layout is the one
+// mapType mirrors: its key and elem must be t's.
+func mapTypeOf(t reflect.Type) (*mapType, bool) {
+	mt := (*mapType)(unsafe.Pointer(typePtr(t)))
+	ok := mt.key == typePtr(t.Key()) && mt.elem == typePtr(t.Elem()) &&
+		mt.groupSize == slotsOffset+groupSlots*mt.slotSize && mt.elemOff < mt.slotSize
+	return mt, ok
+}
+
+// walkMap walks the first maxElems entries of the map of type t whose
+// runtime header (internal/runtime/maps.Map) is at addr, in memory order,
+// as delve does: a small map (dirLen 0) is one group of 8 slots at dirPtr;
+// otherwise dirPtr is an array of dirLen table pointers (several entries
+// may share a table), and each table has lengthMask+1 groups. A slot is
+// full if its control byte's top bit is clear.
+func (w *rawWalker) walkMap(t reflect.Type, addr uintptr, level int) {
+	mt, ok := mapTypeOf(t)
+	if !ok {
+		w.badMaps++
+		return
+	}
+	hdr := w.read(addr, mapHeaderSize)
+	if hdr == nil {
+		return
+	}
+	w.maps++
+	dirPtr, dirLen := word(hdr[16:]), int(word(hdr[24:]))
+	entries := 0
+	group := func(g uintptr) bool { // walks group g's full slots; false once maxElems are done
+		b := w.read(g, mt.groupSize)
+		if b == nil {
+			return true
+		}
+		for i := range uintptr(groupSlots) {
+			if b[i]&ctrlEmpty != 0 {
+				continue
+			}
+			if entries >= w.maxElems {
+				return false
+			}
+			slot := b[slotsOffset+i*mt.slotSize:][:mt.slotSize]
+			w.entry(t, mt, slot, entries, level)
+			entries++
+		}
+		return entries < w.maxElems
+	}
+	if dirLen == 0 {
+		if dirPtr != 0 {
+			group(dirPtr)
+		}
+		return
+	}
+	if dirLen < 0 || dirLen > maxDirLen {
+		w.badMaps++
+		return
+	}
+	dir := w.read(dirPtr, uintptr(dirLen)*ptrSize)
+	if dir == nil {
+		return
+	}
+	seen := map[uintptr]bool{}
+	for i := range dirLen {
+		tab := word(dir[i*ptrSize:])
+		if tab == 0 || seen[tab] {
+			continue
+		}
+		seen[tab] = true
+		tb := w.read(tab, tableSize)
+		if tb == nil {
+			continue
+		}
+		groups, n := word(tb[16:]), word(tb[24:])+1
+		if n > maxGroups {
+			w.badMaps++
+			continue
+		}
+		for g := range n {
+			if !group(groups + g*mt.groupSize) {
+				return
+			}
+		}
+	}
+}
+
+// entry walks the key and value in a map slot, the i'th entry walked.
+func (w *rawWalker) entry(t reflect.Type, mt *mapType, slot []byte, i, level int) {
+	kt, et := t.Key(), t.Elem()
+	key := slot[:min(kt.Size(), uintptr(len(slot)))]
+	if mt.flags&mapIndirectKey != 0 {
+		key = w.read(word(slot), kt.Size())
+	}
+	elem := slot[mt.elemOff:][:min(et.Size(), mt.slotSize-mt.elemOff)]
+	if mt.flags&mapIndirectElem != 0 {
+		elem = w.read(word(slot[mt.elemOff:]), et.Size())
+	}
+	if key == nil || uintptr(len(key)) != kt.Size() || elem == nil || uintptr(len(elem)) != et.Size() {
+		return
+	}
+	// Name the entry by its key if it's a basic value, otherwise by its
+	// position in memory order.
+	n := len(w.expr)
+	keyExpr, valExpr := "<key "+strconv.Itoa(i)+">", ""
+	if lit, ok := w.keyLiteral(kt, key); ok {
+		keyExpr, valExpr = "<key "+lit+">", "["+lit+"]"
+	} else {
+		valExpr = "[" + keyExpr + "]"
+	}
+	w.expr = append(w.expr[:n], keyExpr...)
+	w.walk(kt, key, level+1)
+	w.expr = append(w.expr[:n], valExpr...)
+	w.walk(et, elem, level+1)
+	w.expr = w.expr[:n]
+}
+
+// keyLiteral is keyLiteral for a key of type t whose bytes are b.
+func (w *rawWalker) keyLiteral(t reflect.Type, b []byte) (string, bool) {
+	switch t.Kind() {
+	case reflect.String:
+		s, ok := w.stringValue(t, b)
+		return strconv.Quote(s), ok
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return strconv.FormatInt(signExtend(b), 10), true
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		var u uint64
+		for i := len(b) - 1; i >= 0; i-- {
+			u = u<<8 | uint64(b[i])
+		}
+		return strconv.FormatUint(u, 10), true
+	case reflect.Bool:
+		return strconv.FormatBool(b[0] != 0), true
+	}
+	return "", false
+}
+
+// signExtend returns the little-endian signed integer in b.
+func signExtend(b []byte) int64 {
+	var u uint64
+	for i := len(b) - 1; i >= 0; i-- {
+		u = u<<8 | uint64(b[i])
+	}
+	shift := 64 - 8*uint(len(b))
+	return int64(u<<shift) >> shift
 }
 
 // stringValue returns the contents of a string, byte slice or byte array
@@ -293,6 +463,6 @@ func walkRaw(w *walker, names []string, args []any) {
 		w.expr = append(w.expr[:0], names[i]...)
 		r.walk(t, r.read(p.Pointer(), t.Size()), 0)
 	}
-	fmt.Fprintf(os.Stderr, "argmatch-stats: %s raw %v reads=%d bytes=%d readErrs=%d mapsSkipped=%d badTypes=%d rows=%d\n",
-		w.fn, time.Since(start).Round(time.Microsecond), r.reads, r.bytes, r.readErrs, r.maps, r.badTypes, len(w.rows))
+	fmt.Fprintf(os.Stderr, "argmatch-stats: %s raw %v reads=%d bytes=%d readErrs=%d maps=%d badMaps=%d badTypes=%d rows=%d\n",
+		w.fn, time.Since(start).Round(time.Microsecond), r.reads, r.bytes, r.readErrs, r.maps, r.badMaps, r.badTypes, len(w.rows))
 }

@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unicode/utf8"
 	"unsafe"
 )
@@ -25,6 +26,11 @@ var (
 	out     io.Writer = os.Stderr
 
 	active sync.Map // IDs of goroutines running Check, to detect re-entry
+
+	// useReflect selects the original walker, which reads values directly
+	// with reflect and can crash the program, instead of the raw one
+	// (PROTOTYPE: set ARGMATCH_WALKER=reflect when the program runs).
+	useReflect = os.Getenv("ARGMATCH_WALKER") == "reflect"
 )
 
 // Check reports every string in args that equals one of needles (or, if
@@ -89,15 +95,21 @@ func Check(calls *uint32, maxCalls int, guard bool, needles []string, exact, ign
 	})
 
 	w := walker{options: o, fn: fn}
-	for i, arg := range args {
-		// arg holds *T, where T is the parameter's static type, so that an
-		// interface parameter stays an interface.
-		p := reflect.ValueOf(arg)
-		if p.Kind() != reflect.Pointer || p.IsNil() {
-			continue
+	if useReflect {
+		start := time.Now()
+		for i, arg := range args {
+			// arg holds *T, where T is the parameter's static type, so that an
+			// interface parameter stays an interface.
+			p := reflect.ValueOf(arg)
+			if p.Kind() != reflect.Pointer || p.IsNil() {
+				continue
+			}
+			w.expr = append(w.expr[:0], names[i]...)
+			w.walk(p.Elem(), 0)
 		}
-		w.expr = append(w.expr[:0], names[i]...)
-		w.walk(p.Elem(), 0)
+		fmt.Fprintf(os.Stderr, "argmatch-stats: %s reflect %v rows=%d\n", fn, time.Since(start).Round(time.Microsecond), len(w.rows))
+	} else {
+		walkRaw(&w, names, args) // PROTOTYPE
 	}
 	if len(w.rows) == 0 {
 		return

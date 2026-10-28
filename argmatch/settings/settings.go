@@ -33,6 +33,7 @@ type Settings struct {
 	MaxTime        time.Duration
 	MaxMem         int64
 	Out            string // "" for stderr
+	Stats          bool   // print each check's time and read counts to stderr
 }
 
 // Default returns the default settings, with no needles.
@@ -74,8 +75,8 @@ func Decode(enc string) (Settings, error) {
 // ARGMATCH_MATCHFILE (which, if either is set, replace the needles),
 // ARGMATCH_EXACT, ARGMATCH_IGNORECLOSURES, ARGMATCH_IGNORELIBS,
 // ARGMATCH_IGNORETYPES, ARGMATCH_DEPTH, ARGMATCH_MAXELEMS,
-// ARGMATCH_MAXFIELDS, ARGMATCH_MAXCALLS, ARGMATCH_MAXTIME, ARGMATCH_MAXMEM
-// and ARGMATCH_OUT. It returns the names of the variables it used, and an
+// ARGMATCH_MAXFIELDS, ARGMATCH_MAXCALLS, ARGMATCH_MAXTIME, ARGMATCH_MAXMEM,
+// ARGMATCH_OUT and ARGMATCH_STATS. It returns the names of the variables it used, and an
 // error for the first one it couldn't use; the others are still applied.
 func (s *Settings) FromEnv() (used []string, err error) {
 	fail := func(name string, e error) {
@@ -149,6 +150,7 @@ func (s *Settings) FromEnv() (used []string, err error) {
 	if v, ok := get("ARGMATCH_OUT"); ok {
 		s.Out = v
 	}
+	setBool("ARGMATCH_STATS", &s.Stats)
 	return used, err
 }
 

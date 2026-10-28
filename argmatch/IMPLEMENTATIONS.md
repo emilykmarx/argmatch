@@ -1,19 +1,19 @@
-# We've tried 3 ways of implementing argmatch: delve, reflect, go-spew
+# We've tried 4 ways of implementing argmatch: delve, reflect, go-spew, raw memory
 
-argmatch doesn't stop or attach to the program it checks. It only changes the program's code at compile time. So every version injects a call at the top of each target function, and that call reads the function's receiver and arguments from inside the running program, while other goroutines keep running and changing them. The versions differ in how that call reads the values:
+argmatch doesn't stop or attach to the program it checks. It only changes the program's code at compile time. So every version injects a call at the top of each target function, and that call reads the function's receiver and arguments from inside the running program, while other goroutines keep running and changing them. The versions differ in how that call reads the values. `main` now uses the raw-memory version; the delve version is tagged `delve-walker`, and the reflect version is `d97bfca` on the `reflect-port` branch.
 
-| | delve (`main`) | reflect (`reflect-port`) | go-spew (experiment only) |
-|---|---|---|---|
-| How it reads | delve's `EvalExpression`, reading through `/proc/self/mem` | `reflect`, plus `unsafe` for unexported fields | `spew.Sdump`, which also uses `reflect` plus `unsafe` |
-| Can crash the program | no | **yes**, 5 of 10 Prometheus runs | **yes**, 4 of 10 Prometheus runs |
-| Program is ready after | 20 s to over a minute (see below) | 1 s | (not measured) |
-| Memory | 0.5–5 GB, growing to the caps | 26–34 MB | similar to reflect |
-| Other goroutines' calls | wait (one lock shared by all checks) | not delayed | not delayed |
-| Program compiled with | `-N -l` (no optimizations) | normal optimizations | normal optimizations |
-| Closures' captured variables | followed (`-ignoreclosures=false`) | not followed | not followed |
-| Map entries checked | first `-maxelems` in memory order | `-maxelems` in random iteration order | all of them |
+| | delve (tag `delve-walker`) | reflect (`reflect-port`, `d97bfca`) | go-spew (experiment only) | raw memory (`main`) |
+|---|---|---|---|---|
+| How it reads | delve's `EvalExpression`, reading through `/proc/self/mem` | `reflect`, plus `unsafe` for unexported fields | `spew.Sdump`, which also uses `reflect` plus `unsafe` | `/proc/self/mem`, decoded with `reflect`'s type layout |
+| Can crash the program | no | **yes**, 5 of 10 Prometheus runs | **yes**, 4 of 10 Prometheus runs | possible but not seen (0 of 20 runs) |
+| Program is ready after | 20 s to over a minute (see below) | 1 s | (not measured) | 1 s |
+| Memory | 0.5–5 GB, growing to the caps | 26–34 MB | similar to reflect | about 32 MB |
+| Other goroutines' calls | wait (one lock shared by all checks) | not delayed | not delayed | not delayed |
+| Program compiled with | `-N -l` (no optimizations) | normal optimizations | normal optimizations | normal optimizations |
+| Closures' captured variables | followed (`-ignoreclosures=false`) | not followed | not followed | not followed |
+| Map entries checked | first `-maxelems` in memory order | `-maxelems` in random iteration order | all of them | first `-maxelems` in memory order |
 
-## delve (`main`)
+## delve (tag `delve-walker`)
 
 Delve loads each argument's whole tree from the program's memory, using the binary's DWARF debug info, then argmatch searches the loaded tree.
 
@@ -61,9 +61,18 @@ argmatch walks each value with `reflect` on the calling goroutine, searching as 
   - its last release was in 2018.
 - **Build detail:** `rt`'s go-spew version had to match the one Prometheus already links (`v1.1.2-0.20180830191138-d8f796af33cc`). Otherwise the link fails with a fingerprint mismatch.
 
+## raw memory (`main`)
+
+Fix 4 below, now on `main`. argmatch reads every value's bytes through `/proc/self/mem` and decodes them using `reflect` only for type layout (sizes, field offsets, element types). Maps are decoded from the runtime's map layout (Go 1.24 and later), written from `internal/runtime/maps` rather than adapted from delve's `mapiter.go`, which works on delve's DWARF-based values.
+
+- **Fast and small:** in Prometheus at `-depth 10 -maxelems 64 -maxcalls 3`, `/-/ready` answered after 1 s, memory stayed at about 32 MB, and all 70 checks took 1.4 s together. The slowest, `web.(*Handler).Run`, took 177 ms, with 167k reads of about 5,000 maps. That's about 3 times the reflect version's time (477 ms in total, 45 ms for `Handler.Run`), because each read is a system call (about 1.4 µs, decoding included), but far below delve's seconds per check.
+- **Didn't crash in 20 Prometheus runs,** where the reflect version crashed in about half. It never uses the runtime's map iterator, and never follows a pointer from the program's data in Go code.
+- **Can still crash in one case:** an interface's dynamic type is a type pointer read from memory. It's used only if it points into the executable's read-only memory, but a stale pointer into freed and reused memory can pass that check without being a type descriptor. `reflect` would then read nonsense from it, and could fault or throw. Stricter checks were considered (the exact range of the type section, checking the descriptor's header, `SetPanicOnFault`) but not done.
+- **Other limits:** torn reads can still give wrong or missed rows; closures and channels aren't followed; a map with an unexpected layout (another Go version) is skipped.
+
 ## Ways to make the reflect version safe
 
-These fixes were considered, from least to most work:
+These fixes were considered, from least to most work. Fix 4 is the raw-memory version above.
 
 1. **Skip maps,** and add `debug.SetPanicOnFault(true)` plus `recover` in `Check`. Removes the map throw, faults and nil pointers, but loses everything inside maps.
 2. **Iterate maps through the runtime's map internals** with `unsafe`, without the runtime's iterator. Avoids the map throw only, and depends on Go's map layout, which changes between versions.

@@ -83,7 +83,7 @@ func TestMaxTime(t *testing.T) {
 	if got != header {
 		t.Errorf("matches:\n%s\nwant only the header", got)
 	}
-	if want := "main.ID.F: stopped loading at -maxtime"; !strings.Contains(stderr, want) {
+	if want := "main.ID.F: stopped at -maxtime"; !strings.Contains(stderr, want) {
 		t.Errorf("stderr:\n%s\nwant %q", stderr, want)
 	}
 	if got, stderr := runExampleStderr(t, "-func", "main.ID.F", "-match", "needle", "-maxtime", "1m"); got != wantF || stderr != "" {
@@ -96,7 +96,7 @@ func TestMaxTime(t *testing.T) {
 // nothing.
 func TestMaxMem(t *testing.T) {
 	got, stderr := runExampleStderr(t, "-func", "main.ID.F", "-match", "needle", "-maxmem", "1")
-	if want := "main.ID.F: stopped loading at -maxmem"; !strings.Contains(stderr, want) {
+	if want := "main.ID.F: stopped at -maxmem"; !strings.Contains(stderr, want) {
 		t.Errorf("stderr:\n%s\nwant %q", stderr, want)
 	}
 	// What's found depends on when the limit was hit, but it's a prefix of
@@ -218,19 +218,17 @@ func TestIgnoreClosuresDefault(t *testing.T) {
 	}
 }
 
-// TestClosure checks that with -ignoreclosures=false, matches reached
-// through a func value's captured variables are reported, marked with the
-// closure and the captured variable. With -exact=false as well, all the
-// columns are written.
-func TestClosure(t *testing.T) {
-	got := runExample(t, "-func", "main.G", "-match", "needle", "-ignoreclosures=false", "-exact=false")
-	want := "needle,haystack,function,expression,closure,types\n" +
-		`needle,needle,main.G,r.Fn[captured receiver].Path,true,main.Reloader,closure main.(*Handler).Apply-fm,main.Handler,main.ID
-needle,needle,main.G,named[captured named].Name,true,closure main.main.func1,main.Named,main.ID3
-needle,needle,main.G,basic[captured needle],true,closure main.main.func2
-`
-	if got != want {
-		t.Errorf("matches:\n%s\nwant:\n%s", got, want)
+// TestClosuresUnsupported checks that -ignoreclosures=false is refused,
+// since the type information from reflect doesn't describe the variables
+// closures capture.
+func TestClosuresUnsupported(t *testing.T) {
+	tmp := t.TempDir()
+	wrapper := filepath.Join(tmp, "argmatch")
+	run(t, ".", "go", "build", "-o", wrapper, ".")
+	cmd := exec.Command(wrapper, "-func", "main.G", "-match", "needle", "-ignoreclosures=false", "compile")
+	out, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "-ignoreclosures=false isn't supported") {
+		t.Errorf("argmatch -ignoreclosures=false: err %v, output %q; want an error saying it isn't supported", err, out)
 	}
 }
 
@@ -412,4 +410,51 @@ func runStderr(t *testing.T, dir, name string, args ...string) (stdout, stderr s
 		t.Fatalf("%s %s: %v\n%s", name, strings.Join(args, " "), err, errb.String())
 	}
 	return string(out), errb.String()
+}
+
+// TestMaps checks that maps are decoded from the runtime's map layout:
+// small maps, maps big enough for tables, indirect (over 128-byte) keys and
+// values, basic and struct keys, nested maps and a map in an interface. The
+// expected rows are what reflect's own map iteration found (see the
+// reflect-port branch); all entries fit in -maxelems, so the order in which
+// entries are walked doesn't matter.
+func TestMaps(t *testing.T) {
+	if testing.Short() {
+		t.Skip("rebuilds the standard library under argmatch")
+	}
+	rtDir, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmp := t.TempDir()
+	wrapper := filepath.Join(tmp, "argmatch")
+	run(t, rtDir, "go", "build", "-o", wrapper, ".")
+	out := filepath.Join(tmp, "out.txt")
+	toolexec := strings.Join([]string{`"` + wrapper + `"`, "-out", `"` + out + `"`, "-rtdir", `"` + rtDir + `"`,
+		"-func", "main.(*Holder).F", "-match", "needle", "-maxelems", "100", "-depth", "10"}, " ")
+	prog := filepath.Join(tmp, "maps")
+	run(t, filepath.Join(rtDir, "testdata", "maps"), "go", "build", "-toolexec", toolexec, "-o", prog, ".")
+	run(t, tmp, prog)
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Split(strings.TrimSpace(string(data)), "\n")
+	slices.Sort(got)
+	want := []string{
+		`needle,function,expression,types`,
+		`needle,main.(*Holder).F,h.Any[-3],main.Holder,map[int8]main.Name (implements interface {}),main.Name`,
+		`needle,main.(*Holder).F,h.BigKey[<key 0>],main.Holder,main.Name`,
+		`needle,main.(*Holder).F,"h.BigVal[""k""].Name",main.Holder,main.Big,main.Name`,
+		`needle,main.(*Holder).F,h.Bools[true].Name,main.Holder,main.Big,main.Name`,
+		`needle,main.(*Holder).F,h.Large[-5],main.Holder,main.Name`,
+		`needle,main.(*Holder).F,"h.Nested[""outer""][65535]",main.Holder,main.Name`,
+		`needle,main.(*Holder).F,h.SK[<key 0>],main.Holder,main.Name`,
+		`needle,main.(*Holder).F,"h.Small[""a""]",main.Holder,main.Name`,
+		`needle,main.(*Holder).F,"h.Strs<key ""needle"">",main.Holder,main.Name`,
+	}
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Errorf("matches:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
 }

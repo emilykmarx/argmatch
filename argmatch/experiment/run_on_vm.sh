@@ -129,9 +129,18 @@ while :; do
     sleep 5
 done
 captured=$(( $(date +%s) - start ))
+# Copy the output now, so it's what argmatch had written by $captured.
+sudo cp $OUTDIR/matches.csv $dir/matches.csv 2>/dev/null || : > $dir/matches.csv
+sudo chown $(id -u):$(id -g) $dir/matches.csv
 if [ -n "${reload_pid:-}" ]; then
-    # Let it finish (it restores the config map), but not forever.
+    # Let it finish (it restores the config map), but not forever: a reload
+    # can block for minutes while slow checks run. Killing it still restores
+    # the config map (its EXIT trap).
     for _ in $(seq 60); do kill -0 $reload_pid 2>/dev/null || break; sleep 5; done
+    if kill -0 $reload_pid 2>/dev/null; then
+        kill $reload_pid
+        log "config reloads not done after 300s; stopped them"
+    fi
     wait $reload_pid 2>/dev/null && log "config reloads done" || log "config reload FAILED: $(tail -1 $dir/reload.log 2>/dev/null)"
 fi
 if [ ${#viewer_pids[@]} -gt 0 ]; then
@@ -140,14 +149,16 @@ if [ ${#viewer_pids[@]} -gt 0 ]; then
     log "viewer: $(tail -1 $dir/viewer.log)"
 fi
 
-# 5. Save the output and the pod's log.
-sudo cp $OUTDIR/matches.csv $dir/matches.csv 2>/dev/null || : > $dir/matches.csv
-sudo chown $(id -u):$(id -g) $dir/matches.csv
+# 5. Save the pod's log (the output was copied above).
 kubectl --context $CTX logs --timestamps deploy/prometheus-meta -c prometheus > $dir/pod.log 2>&1 || true
 rows=$(( $(wc -l < $dir/matches.csv) - 1 ))
 # Seconds between argmatch's last check and the capture.
 last=$(grep ' argmatch-stats: ' $dir/pod.log | tail -1 | cut -d' ' -f1)
 last_check=never
-[ -n "$last" ] && last_check=$(( $(date +%s) - $(date -d "$last" +%s) ))
+# Checks after the capture (during the reload wait) count as 0.
+if [ -n "$last" ]; then
+    last_check=$(( start + captured - $(date -d "$last" +%s) ))
+    [ $last_check -lt 0 ] && last_check=0
+fi
 log "saved $rows rows after ${captured}s; last check ${last_check}s before"
 echo "RESULT name=$name build=${build}s load=${load}s ready=${ready:-never}s alert=${alert:-never}s captured=${captured}s last_check=${last_check}s rows=$rows" | tee -a $dir/timing.txt

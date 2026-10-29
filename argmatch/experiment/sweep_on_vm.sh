@@ -43,8 +43,11 @@ for r in "${RUNS[@]}"; do
     fi
     say "$name: starting (WAIT=$wait, $changes)"
     # shellcheck disable=SC2086
-    if ! WAIT=$wait timeout 1200 bash $here/run_on_vm.sh $name $BASE $changes > $RESULTS/$name.out 2>&1; then
-        say "$name: FAILED (exit $?): $(tail -1 $RESULTS/$name.out)"
+    status=0
+    WAIT=$wait timeout 1200 bash $here/run_on_vm.sh $name $BASE $changes > $RESULTS/$name.out 2>&1 || status=$?
+    if [ $status != 0 ]; then
+        # 124: timeout killed it
+        say "$name: FAILED (exit $status): $(tail -1 $RESULTS/$name.out)"
         continue
     fi
     if line=$(bash $here/analyze.sh $dir $PARAM_KEYS 2> $dir/analyze.err); then

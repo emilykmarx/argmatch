@@ -71,7 +71,9 @@ def main():
         ("last_check", result.get("last_check", "?")),
         ("still_checking", still_checking(result.get("last_check"))),
         ("unchecked", unchecked(d)),
-        ("raw_rows", len(rows(os.path.join(d, "matches.csv")))),
+        # run_on_vm.sh's count, if any: parsing a multi-GB matches.csv takes
+        # minutes and tens of GB of memory
+        ("raw_rows", result.get("rows") or len(rows(os.path.join(d, "matches.csv")))),
         ("dedup_rows", len(rows(os.path.join(d, "deduped.csv")))),
         ("pairs", len(nt)),
         ("needles", len({r[0] for r in nt})),

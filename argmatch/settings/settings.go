@@ -30,6 +30,7 @@ type Settings struct {
 	MaxElems       int
 	MaxFields      int
 	MaxCalls       int
+	CallInterval   time.Duration
 	MaxTime        time.Duration
 	MaxMem         int64
 	Out            string // "" for stderr
@@ -75,7 +76,8 @@ func Decode(enc string) (Settings, error) {
 // ARGMATCH_MATCHFILE (which, if either is set, replace the needles),
 // ARGMATCH_EXACT, ARGMATCH_IGNORECLOSURES, ARGMATCH_IGNORELIBS,
 // ARGMATCH_IGNORETYPES, ARGMATCH_DEPTH, ARGMATCH_MAXELEMS,
-// ARGMATCH_MAXFIELDS, ARGMATCH_MAXCALLS, ARGMATCH_MAXTIME, ARGMATCH_MAXMEM,
+// ARGMATCH_MAXFIELDS, ARGMATCH_MAXCALLS, ARGMATCH_CALLINTERVAL,
+// ARGMATCH_MAXTIME, ARGMATCH_MAXMEM,
 // ARGMATCH_OUT and ARGMATCH_STATS. It returns the names of the variables it used, and an
 // error for the first one it couldn't use; the others are still applied.
 func (s *Settings) FromEnv() (used []string, err error) {
@@ -131,14 +133,18 @@ func (s *Settings) FromEnv() (used []string, err error) {
 	setInt("ARGMATCH_MAXELEMS", &s.MaxElems)
 	setInt("ARGMATCH_MAXFIELDS", &s.MaxFields)
 	setInt("ARGMATCH_MAXCALLS", &s.MaxCalls)
-	if v, ok := get("ARGMATCH_MAXTIME"); ok {
-		d, e := time.ParseDuration(v)
-		if e != nil {
-			fail("ARGMATCH_MAXTIME", e)
-		} else {
-			s.MaxTime = d
+	setDuration := func(name string, p *time.Duration) {
+		if v, ok := get(name); ok {
+			d, e := time.ParseDuration(v)
+			if e != nil {
+				fail(name, e)
+				return
+			}
+			*p = d
 		}
 	}
+	setDuration("ARGMATCH_CALLINTERVAL", &s.CallInterval)
+	setDuration("ARGMATCH_MAXTIME", &s.MaxTime)
 	if v, ok := get("ARGMATCH_MAXMEM"); ok {
 		var b ByteSize
 		if e := b.Set(v); e != nil {

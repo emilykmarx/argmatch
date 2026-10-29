@@ -192,7 +192,8 @@ func TestIgnoreTypes(t *testing.T) {
 }
 
 // TestMaxCalls checks that only the first -maxcalls calls of a function are
-// checked (3 by default, 0 for all): Repeat is called 5 times.
+// checked (3 by default, 0 for all), and that -callinterval skips calls
+// soon after a check: Repeat is called 5 times in quick succession.
 func TestMaxCalls(t *testing.T) {
 	const row = "needle,main.Repeat,in.Name,main.Named,main.ID3\n"
 	for _, test := range []struct {
@@ -202,6 +203,9 @@ func TestMaxCalls(t *testing.T) {
 		{nil, 3},
 		{[]string{"-maxcalls", "1"}, 1},
 		{[]string{"-maxcalls", "0"}, 5},
+		{[]string{"-maxcalls", "0", "-callinterval", "1h"}, 1},
+		{[]string{"-maxcalls", "0", "-callinterval", "1ns"}, 5},
+		{[]string{"-callinterval", "1h"}, 1},
 	} {
 		got := runExample(t, append([]string{"-func", "main.Repeat", "-match", "needle"}, test.flags...)...)
 		if want := header + strings.Repeat(row, test.rows); got != want {

@@ -70,6 +70,7 @@ var (
 	recvOnly       = flag.Bool("recvonly", envBool("ARGMATCH_RECVONLY", false), "check only method receivers, not parameters; functions without a receiver are skipped (env ARGMATCH_RECVONLY)")
 	depth          = flag.Int("depth", envInt("ARGMATCH_DEPTH", 5), "how many levels of nested structs, arrays, maps and pointers-to-pointers to walk, counted as delve's MaxVariableRecurse (env ARGMATCH_DEPTH)")
 	maxCalls       = flag.Int("maxcalls", envInt("ARGMATCH_MAXCALLS", 3), "check only the first maxcalls calls of each function; later calls skip the check and cost almost nothing; 0 means no limit (env ARGMATCH_MAXCALLS)")
+	callInterval   = flag.Duration("callinterval", envDuration("ARGMATCH_CALLINTERVAL", 0), "after checking a call of a function, don't check its calls for this long (e.g. 5s); they don't count towards -maxcalls, so the checks are spread out in time; 0 means no gap (env ARGMATCH_CALLINTERVAL)")
 	maxElems       = flag.Int("maxelems", envInt("ARGMATCH_MAXELEMS", 64), "how many elements of each array, slice and map to walk (map entries in memory order); the work per check grows roughly as maxelems^depth (env ARGMATCH_MAXELEMS)")
 	maxFields      = flag.Int("maxfields", envInt("ARGMATCH_MAXFIELDS", -1), "how many fields of each struct to walk, in declaration order; -1 walks them all, and later fields aren't searched (env ARGMATCH_MAXFIELDS)")
 	ignoreLibs     = flag.Bool("ignorelibs", envBool("ARGMATCH_IGNORELIBS", true), "don't walk the fields of struct types in packages that stacklog.IgnoreFn ignores (the standard library, gRPC, golang.org/x/net, ...); values of those types are still checked themselves (env ARGMATCH_IGNORELIBS)")
@@ -97,6 +98,7 @@ func runTimeSettings() settings.Settings {
 		MaxElems:       *maxElems,
 		MaxFields:      *maxFields,
 		MaxCalls:       *maxCalls,
+		CallInterval:   *callInterval,
 		MaxTime:        *maxTime,
 		MaxMem:         int64(*maxMem),
 		Out:            *outPath,
@@ -589,7 +591,7 @@ func rtExports(tool string) []string {
 		return `"` + s + `"`
 	}
 	toolexec := strings.Join([]string{quote(self), "-func", quote(*funcName), "-stacklog", quote(*stackLog), "-match", quote(*needle),
-		"-matchfile", quote(*matchFile), "-depth", strconv.Itoa(*depth), "-maxelems", strconv.Itoa(*maxElems), "-maxfields", strconv.Itoa(*maxFields), "-maxtime", maxTime.String(), "-maxmem", maxMem.String(), "-maxcalls", strconv.Itoa(*maxCalls), "-recvonly=" + strconv.FormatBool(*recvOnly), "-exact=" + strconv.FormatBool(*exact), "-ignoreclosures=" + strconv.FormatBool(*ignoreClosures),
+		"-matchfile", quote(*matchFile), "-depth", strconv.Itoa(*depth), "-maxelems", strconv.Itoa(*maxElems), "-maxfields", strconv.Itoa(*maxFields), "-maxtime", maxTime.String(), "-maxmem", maxMem.String(), "-maxcalls", strconv.Itoa(*maxCalls), "-callinterval", callInterval.String(), "-recvonly=" + strconv.FormatBool(*recvOnly), "-exact=" + strconv.FormatBool(*exact), "-ignoreclosures=" + strconv.FormatBool(*ignoreClosures),
 		"-ignorelibs=" + strconv.FormatBool(*ignoreLibs), "-ignoretypes", quote(*ignoreTypes),
 		"-stats=" + strconv.FormatBool(*stats), "-out", quote(*outPath), "-rtdir", quote(*rtDir)}, " ")
 	args := []string{"list", "-deps", "-export", "-toolexec", toolexec,

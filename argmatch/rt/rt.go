@@ -60,6 +60,8 @@ var (
 
 	ignored sync.Map // reflect.Type -> bool: whether its fields are skipped (see skipFields)
 
+	lastCheck sync.Map // *uint32 (a function's call counter) -> *atomic.Int64: its last check's time, for CallInterval
+
 	registerMu sync.Mutex
 	registered []string // the instrumented functions (see Register)
 )
@@ -95,7 +97,9 @@ func Register(fns []string) {
 //
 // calls counts the calls of fn so far (each instrumented function has its
 // own counter). Once it reaches MaxCalls, Check returns at once, so later
-// calls cost almost nothing. MaxCalls 0 means no limit.
+// calls cost almost nothing. MaxCalls 0 means no limit. If CallInterval is
+// set, calls within CallInterval of fn's last check aren't checked either,
+// and don't count towards MaxCalls, so the checks are spread out in time.
 //
 // If guard is set, the target function may be called by Check itself, so
 // calls made while checking are ignored. That's only possible for functions
@@ -204,20 +208,34 @@ func printRegistered() {
 	}
 }
 
-// admit counts a call in calls and reports whether it should be checked,
-// i.e. whether fewer than s.MaxCalls calls have been (0 for no limit).
+// admit reports whether a call should be checked: whether fewer than
+// s.MaxCalls calls have been checked (0 for no limit), and, if
+// s.CallInterval is set, the last check was at least that long ago. If so,
+// it counts the call in calls.
 func admit(calls *uint32, s *settings.Settings) bool {
-	if s.MaxCalls <= 0 {
-		return true
-	}
 	// Load first, so the counter stops growing (and can't wrap) once the
 	// limit is reached. Concurrent first calls may overshoot the limit
 	// slightly. Calls of the function made by Check itself (if it's in the
 	// standard library) count too.
-	if atomic.LoadUint32(calls) >= uint32(s.MaxCalls) {
+	if s.MaxCalls > 0 && atomic.LoadUint32(calls) >= uint32(s.MaxCalls) {
 		return false
 	}
-	atomic.AddUint32(calls, 1)
+	if s.CallInterval > 0 {
+		v, ok := lastCheck.Load(calls)
+		if !ok {
+			v, _ = lastCheck.LoadOrStore(calls, new(atomic.Int64))
+		}
+		last := v.(*atomic.Int64)
+		now := time.Now().UnixNano()
+		prev := last.Load()
+		// Of concurrent calls, only the one that updates last is checked.
+		if prev != 0 && now-prev < int64(s.CallInterval) || !last.CompareAndSwap(prev, now) {
+			return false
+		}
+	}
+	if s.MaxCalls > 0 {
+		atomic.AddUint32(calls, 1)
+	}
 	return true
 }
 

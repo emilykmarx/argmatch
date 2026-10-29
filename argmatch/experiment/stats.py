@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Print one tab-separated summary line for an experiment's result directory:
-its name, timings (from timing.txt), the number of raw and deduplicated rows,
+its name, timings (from timing.txt), whether argmatch was still checking at
+the capture (its last check was under 30 s before), the number of
+instrumented functions never checked (also written to unchecked.txt and
+warned about on stderr), the number of raw and deduplicated rows,
 and, in needle_types.csv, the number of rows (unique (needle, receiver type)
 pairs) and of distinct needles, param keys and types.
 
@@ -20,6 +23,39 @@ def rows(path):
         return read_csv(f.read())[1:]
 
 
+def still_checking(last_check):
+    """Return "yes" if the last check was under 30 s before the capture."""
+    if not last_check or not last_check.rstrip("s").isdigit():
+        return "?"
+    return "yes" if int(last_check.rstrip("s")) < 30 else "no"
+
+
+def unchecked(d):
+    """Write the instrumented functions pod.log shows were never checked to
+    unchecked.txt, warn about them on stderr, and return how many there
+    are, or "?" if pod.log has no list of instrumented functions (argmatch
+    built without ARGMATCH_STATS)."""
+    instrumented, checked = set(), set()
+    for line in open(os.path.join(d, "pod.log"), errors="replace"):
+        f = line.split()
+        if f and not f[0].startswith("argmatch-"):
+            f = f[1:]  # a timestamp from kubectl logs --timestamps
+        if len(f) >= 2 and f[0] == "argmatch-instrumented:" and not (len(f) == 3 and f[2] == "functions"):
+            instrumented.add(f[1])
+        elif len(f) >= 2 and f[0] == "argmatch-stats:":
+            checked.add(f[1])
+    if not instrumented:
+        print(f"stats.py: {d}: no instrumented functions in pod.log (built without ARGMATCH_STATS?)", file=sys.stderr)
+        return "?"
+    missing = sorted(instrumented - checked)
+    with open(os.path.join(d, "unchecked.txt"), "w") as out:
+        out.writelines(fn + "\n" for fn in missing)
+    if missing:
+        print(f"stats.py: WARNING: {len(missing)} of {len(instrumented)} instrumented functions were never checked "
+              f"(see {os.path.join(d, 'unchecked.txt')}): {', '.join(missing)}", file=sys.stderr)
+    return len(missing)
+
+
 def main():
     d = sys.argv[1]
     timing = open(os.path.join(d, "timing.txt")).read()
@@ -31,6 +67,10 @@ def main():
         ("load", result.get("load", "?")),
         ("ready", result.get("ready", "?")),
         ("alert", result.get("alert", "?")),
+        ("captured", result.get("captured", "?")),
+        ("last_check", result.get("last_check", "?")),
+        ("still_checking", still_checking(result.get("last_check"))),
+        ("unchecked", unchecked(d)),
         ("raw_rows", len(rows(os.path.join(d, "matches.csv")))),
         ("dedup_rows", len(rows(os.path.join(d, "deduped.csv")))),
         ("pairs", len(nt)),

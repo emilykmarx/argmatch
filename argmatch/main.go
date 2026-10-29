@@ -55,6 +55,7 @@ const (
 	rtPkg     = "argmatch/rt"
 	nestedEnv = "ARGMATCH_NESTED" // set while building rt's dependencies
 	checkFn   = "__argmatch_check"
+	regFn     = "__argmatch_register"
 )
 
 // Each flag defaults to an environment variable, for use with
@@ -364,6 +365,7 @@ func compileArgs(tool string, args []string, tmp string) []string {
 			continue // let the compiler report it
 		}
 		var edits []edit
+		var fns []string // the functions instrumented in this file
 		for _, d := range f.Decls {
 			fd, ok := d.(*ast.FuncDecl)
 			if !ok {
@@ -382,14 +384,22 @@ func compileArgs(tool string, args []string, tmp string) []string {
 			}
 			edits = append(edits, instrument(fset, fd, name, instrumented, len(src), isStd)...)
 			instrumented++
+			fns = append(fns, strconv.Quote(name))
+		}
+		if len(fns) > 0 {
+			// Register the file's functions with rt when the program
+			// starts, so that rt knows them all, including those never
+			// called (see rt.Register).
+			edits = append(edits, edit{len(src), fmt.Sprintf("\nfunc init() { %s([]string{%s}) }\n", regFn, strings.Join(fns, ", "))})
 		}
 		if len(edits) > 0 && !declared {
 			// The target package can't import rt (it may be one of rt's
-			// own dependencies), so refer to rt.Check by its linker name
-			// instead, declaring it once per package.
+			// own dependencies), so refer to rt.Check and rt.Register by
+			// their linker names instead, declaring them once per package.
 			edits = append(edits,
 				edit{fset.Position(f.Name.End()).Offset, `; import _ "unsafe"`},
 				edit{len(src), fmt.Sprintf("\n//go:linkname %s %s.Check\nfunc %s(*uint32, bool, string, []string, []interface{})\n", checkFn, rtPkg, checkFn)},
+				edit{len(src), fmt.Sprintf("\n//go:linkname %s %s.Register\nfunc %s([]string)\n", regFn, rtPkg, regFn)},
 			)
 			declared = true
 		}

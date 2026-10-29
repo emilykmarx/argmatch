@@ -59,7 +59,23 @@ var (
 	typesLo, typesHi uintptr
 
 	ignored sync.Map // reflect.Type -> bool: whether its fields are skipped (see skipFields)
+
+	registerMu sync.Mutex
+	registered []string // the instrumented functions (see Register)
 )
+
+// Register records fns as instrumented functions. The wrapper makes each
+// instrumented file call it from an init function, so that by the time the
+// program's main runs, rt knows every instrumented function, including
+// those never called. With Stats, the first check prints them. It may run
+// before rt's own initialization, so it uses only zero-valued variables.
+//
+//go:linkname Register
+func Register(fns []string) {
+	registerMu.Lock()
+	registered = append(registered, fns...)
+	registerMu.Unlock()
+}
 
 // Check reports every string in args that equals one of the needles (or,
 // if Exact is false, contains one), along with the named types and
@@ -111,6 +127,9 @@ func Check(calls *uint32, guard bool, fn string, names []string, args []any) {
 		settingsMu.Lock()
 		if s = current.Load(); s == nil {
 			s = loadSettings()
+			if s.Stats {
+				printRegistered()
+			}
 			current.Store(s)
 		}
 		settingsMu.Unlock()
@@ -171,6 +190,17 @@ func Check(calls *uint32, guard bool, fn string, names []string, args []any) {
 	if s.Stats {
 		fmt.Fprintf(os.Stderr, "argmatch-stats: %s %v reads=%d bytes=%d readErrs=%d maps=%d badMaps=%d badTypes=%d rows=%d\n",
 			fn, time.Since(w.started).Round(time.Microsecond), w.reads, w.bytes, w.readErrs, w.maps, w.badMaps, w.badTypes, len(w.rows))
+	}
+}
+
+// printRegistered prints the instrumented functions registered so far to
+// stderr, one "argmatch-instrumented:" line each, preceded by their number.
+func printRegistered() {
+	registerMu.Lock()
+	defer registerMu.Unlock()
+	fmt.Fprintf(os.Stderr, "argmatch-instrumented: %d functions\n", len(registered))
+	for _, fn := range registered {
+		fmt.Fprintf(os.Stderr, "argmatch-instrumented: %s\n", fn)
 	}
 }
 

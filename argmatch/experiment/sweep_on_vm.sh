@@ -7,6 +7,9 @@
 # Runs whose results already exist (a RESULT line and needle_types.csv) are
 # skipped, so it can be restarted after an interruption. Each run is limited
 # to 20 minutes.
+#
+# usage: sweep_on_vm.sh [NAME|WAIT|CHANGES ...]
+# Each argument is a run, as in RUNS below; without any, RUNS is used.
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 CT=/home/emily/projects/config_tracing
@@ -32,6 +35,7 @@ RUNS=(
     "sweep-e256-1|240|MAXELEMS=256"
     "sweep-e256-2|240|MAXELEMS=256"
 )
+[ $# -gt 0 ] && RUNS=("$@")
 
 say "sweep started: ${#RUNS[@]} runs"
 for r in "${RUNS[@]}"; do

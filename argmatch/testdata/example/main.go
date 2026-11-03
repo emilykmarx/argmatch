@@ -77,6 +77,9 @@ func Lib(u *url.URL) {}
 // Called several times, for -maxcalls
 func Repeat(in Named) {}
 
+// Called in a goroutine, for the ancestry column
+func InGoroutine(in Named) {}
+
 func main() {
 	needle := "needle"
 	id := ID(needle)
@@ -91,5 +94,11 @@ func main() {
 	for range 5 {
 		Repeat(named)
 	}
+	done := make(chan bool)
+	go func() {
+		InGoroutine(named)
+		done <- true
+	}()
+	<-done
 	fmt.Println("done")
 }

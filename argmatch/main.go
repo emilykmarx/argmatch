@@ -160,7 +160,16 @@ func loadFuncs() {
 		}
 		for _, line := range conn.Stacks {
 			if frame, ok := stacklog.FrameFunc(line); ok {
-				// E.g. check closures' enclosing functions instead.
+				// Closures' captured variables can't be checked (see
+				// -ignoreclosures), so their frames are skipped rather
+				// than mapped to their enclosing functions: when the
+				// enclosing function is running, it has a frame of its
+				// own, and when it isn't (the closure escaped it, e.g. a
+				// returned handler), checking its calls finds values from
+				// before the frames in this log.
+				if *ignoreClosures && stacklog.IsClosureFrame(frame) {
+					continue
+				}
 				for _, fn := range stacklog.EnclosingFns(frame) {
 					found[strings.ReplaceAll(fn, "[...]", "")] = true
 				}

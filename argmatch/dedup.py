@@ -6,7 +6,9 @@ Usage: dedup.py [input.csv] > output.csv
 Reads the CSV argmatch wrote (from the file, or stdin if none is given) and
 writes it to stdout with duplicate rows removed, keeping the header. Rows are
 compared whole, except that map positions in the expression column are
-ignored (see below).
+ignored (see below). The call column is left out of the output: it
+identifies the call that found each match, so it'd keep the same match found
+by different calls from being merged.
 
 The output is grouped by needle, and the groups are ordered by how many
 distinct haystacks the needle matched, fewest first, then by the needle's
@@ -99,6 +101,10 @@ def main():
     header = next(rows, None)
     if header is None:
         return
+    if "call" in header:
+        call = header.index("call")
+        rows = (row[:call] + row[call + 1:] for row in rows)
+        header = header[:call] + header[call + 1:]
     needle, expression = header.index("needle"), header.index("expression")
     # Without a haystack column, every haystack is its needle.
     haystack = header.index("haystack") if "haystack" in header else needle

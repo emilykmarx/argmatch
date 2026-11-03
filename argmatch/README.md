@@ -47,6 +47,7 @@ Matches are exact by default: a value is reported only if it equals a match stri
 
 With `-recvonly` (env `ARGMATCH_RECVONLY=1`), only method receivers are checked, not parameters. Functions without a receiver are then skipped, including any named with `-func` or found in `-stacklog`.
 
+## Output
 Matches are written as CSV, one row per match, with these columns:
 
 | Column | Contents |
@@ -55,9 +56,10 @@ Matches are written as CSV, one row per match, with these columns:
 | `haystack` | only with `-exact=false`: the whole value that matched, with non-printable characters, invalid UTF-8 and backslashes escaped as in a Go string literal (`\x00`, `\n`, `\\`), since it can be a binary buffer. With exact matching it would always equal `needle`, so it's left out. |
 | `function` | the instrumented function |
 | `expression` | the path from the parameter to the value, e.g. `o.P.Name` |
+| `call` | the call that found the match, an ID unique in the process; see the calls output below |
 | `types` and every column after it | one per step of the path from the parameter down to the match, in order |
 
-So with the defaults the columns are `needle,function,expression,types`, and with `-exact=false` they're `needle,haystack,function,expression,types`. Scripts reading the output should find columns by name in the header.
+So with the defaults the columns are `needle,function,expression,call,types`, and with `-exact=false` they're `needle,haystack,function,expression,call,types`. Scripts reading the output should find columns by name in the header.
 
 A step of the path is one of:
 - a named type, e.g. `main.Outer`;
@@ -65,11 +67,20 @@ A step of the path is one of:
 
 In expressions, a map entry is named by its key when the key is a string, integer or bool: `m["config.file"]` for the value and `m<key "config.file">` for the key itself. Other keys (e.g. structs) are named by their position, `m[<key 0>]`. Entries are walked in memory order, which depends on a hash seed Go randomizes for each map, so positions, and which entries are within `-maxelems`, can differ between runs. Expressions containing quotes are quoted in the CSV, with the inner quotes doubled, e.g. `"h<key ""needle"">"`.
 
-Each call of an instrumented function writes its own rows, so a function called often repeats the same rows. [dedup.py](dedup.py) removes the duplicates from one run's CSV: `./dedup.py matches.csv > deduped.csv` (or read from stdin). It also merges rows that differ only in a map position, writing it as `<key N>`, and groups the rows by needle, ordering the groups by how many distinct haystacks the needle matched (fewest first) and sorting each group by haystack. Without a `haystack` column (exact matching), that's simply sorting by needle.
+Each call of an instrumented function writes its own rows, so a function called often repeats the same rows. [dedup.py](dedup.py) removes the duplicates from one run's CSV: `./dedup.py matches.csv > deduped.csv` (or read from stdin). It leaves out the `call` column, so that the same match found by different calls is one row. It also merges rows that differ only in a map position, writing it as `<key N>`, and groups the rows by needle, ordering the groups by how many distinct haystacks the needle matched (fewest first) and sorting each group by haystack. Without a `haystack` column (exact matching), that's simply sorting by needle.
 
 Rows have as many step columns as their path has steps, so rows differ in length. The header names only the first step column (`types`). The header is written once, at the top of the output. Errors always go to stderr as plain text, never into the CSV.
 
-Output for `F` in `testdata/example/main.go`:
+Each call that finds matches is also described once, in a second CSV, the calls output, written before the call's matches: `matches.calls.csv` next to `-out matches.csv` (`.calls` goes before the extension), or to stderr without `-out`. Its columns:
+
+| Column | Contents |
+|---|---|
+| `call` | the call's ID, as in the matches' `call` column |
+| `function` | the instrumented function |
+| `ancestry` | the goroutine that made the call: its ID, where it was created, and (with `GODEBUG=tracebackancestors=N`) its ancestors' stacks when they created their children. Taken from `runtime.Stack`, and the same at every point in the goroutine, so it can join the output with other records made the same way, such as the ConfTamer HTTP events (`conftamer/contexttrack/go-inlibrary.patch`). `splitStack` in [rt/rt.go](rt/rt.go) defines both this and `stack`. |
+| `stack` | what that goroutine was running: `runtime.Stack`'s first line and frames, from the instrumented function outwards |
+
+Output for `F` in `testdata/example/main.go`, without the `call` column:
 
 ```
 needle,function,expression,types
@@ -85,6 +96,10 @@ done
 `arr []string` correctly gives no output.
 
 The variables captured by func values (closures and method values) aren't checked, so `G` in the example reports nothing. `-ignoreclosures=false` is refused: argmatch reads values using type information from `reflect`, which doesn't describe captured variables. (The delve version, tagged `delve-walker`, could check them; see [IMPLEMENTATIONS.md](IMPLEMENTATIONS.md).)
+
+### Call IDs
+<!-- Reviewed by Emily -->
+Within a process, a call ID uniquely identifies one call of an instrumented function that finds at least one match. All matches found during that call share the call ID. Each call ID thus corresponds to a single tuple of (function, ancestry, stack), but multiple call IDs may share a tuple (e.g. from a function called twice in a row).
 
 ## How it works
 
@@ -124,7 +139,7 @@ Also tested by hand:
 - **`-callinterval`** (env `ARGMATCH_CALLINTERVAL`, a duration, default 0): after a function is checked, its calls in the next `-callinterval` aren't checked and don't count towards `-maxcalls`. That spreads a function's checks out in time, so that a function called many times a second (e.g. one run per scrape or request) doesn't use up `-maxcalls` in its first second. With `-maxcalls 30 -callinterval 5s`, its checks cover the first 2.5 minutes or so. A function only called in a burst (e.g. once per route while routes are registered) is checked only once.
 - **`-stats`** (env `ARGMATCH_STATS`, a run-time setting) prints a line per check to stderr with its time, reads, bytes read, maps walked, and maps and type pointers skipped.
 - **Function names** are as in stacktraces: `pkg/path.Func`, `pkg.T.M` or `pkg.(*T).M`. Functions written in assembly can't be instrumented.
-- **Names in stack logs** are mapped to declarations by `stacklog.EnclosingFns`, which `parse` uses too. Closures and `go`/`defer` wrappers (`pkg.F.func1.2`, `pkg.F.gowrap1`) mean the function that contains them, and method values (`pkg.T.M-fm`) mean the method. A closure in an inlined function is named after both functions (`pkg.(*T).Run.helper.func5`), and both are checked (`pkg.helper` and `pkg.(*T).Run`). That's guessed from the name, so it can't recover an inlined function from another package, and a value-receiver method inlined into a function is misread. The comment on `EnclosingFns` describes an exact alternative using the frames' file:line.
+- **Names in stack logs:** frames of closures, `go`/`defer` wrappers and method values (`pkg.F.func1.2`, `pkg.F.gowrap1`, `pkg.T.M-fm`; `stacklog.IsClosureFrame`) are skipped, since closures' captured variables can't be checked. Their enclosing functions aren't checked on their account either: when an enclosing function is running, it has a frame of its own in the stack, and when it isn't (the closure escaped it, e.g. a handler it returned), its calls happened before the stack, so their values can't be the ones the stack's code used. Other names are mapped to declarations by `stacklog.EnclosingFns`, which `parse` uses too, and which also maps closures to their enclosing functions. A function inlined into another can be named after both (`pkg.(*T).Run.helper`), and both are checked. That's guessed from the name, so it can't recover an inlined function from another package, and a value-receiver method inlined into a function is misread. The comment on `EnclosingFns` describes an exact alternative using the frames' file:line.
 - **What is matched:** string values and `[]byte`/byte array contents. By default a value matches only if it equals a match string exactly. With `-exact=false` (env `ARGMATCH_EXACT=false`) it also matches if it contains the full match string anywhere, so `-match needle` reports `"xneedlex"` too. The output shows both the match string (`needle`) and the whole value that contained it (`haystack`). A value that contains several match strings gives one row per string. Strings and byte slices are read up to 1 MiB, and arrays, slices and maps up to `-maxelems` elements.
 - **First build is slow:** every package is rebuilt once, because the build cache is keyed on argmatch's settings. The cache key for compiling covers the instrumented functions (`-func`, `-stacklog`), `-recvonly`, the wrapper binary and the helper's sources. Changing any of those recompiles every package. Changing only run-time settings just relinks (see "How it works").
 - **Limitations:**

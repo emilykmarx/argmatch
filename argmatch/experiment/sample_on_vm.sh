@@ -26,7 +26,9 @@ read checks fns full instrumented < <(awk -v max="$maxcalls" '
           print checks + 0, fns + 0, full + 0, n + 0 }' $dir/pod.log)
 
 sudo cp $CT/dump_ancestors/argmatch-out/matches.csv $dir/matches.csv 2>/dev/null && sudo chown $(id -u):$(id -g) $dir/matches.csv
-rows=$(( $(wc -l < $dir/matches.csv) - 1 ))
+# CSV rows, not lines (a field can span lines): a row ends at a newline
+# after an even number of quotes, since quotes in a field are doubled.
+rows=$(awk '{ q += gsub(/"/, "\"") } q % 2 == 0 { n++ } END { print n - 1 }' $dir/matches.csv)
 python3 $A/dedup.py $dir/matches.csv > $dir/deduped.csv
 rm -f $dir/needle_types.csv
 python3 $A/needle_types.py --input $dir/deduped.csv --param-keys $RESULTS/param_keys.txt --output $dir/needle_types.csv

@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"runtime/metrics"
@@ -44,9 +45,11 @@ var (
 	current    atomic.Pointer[settings.Settings]
 	settingsMu sync.Mutex
 
-	outOnce sync.Once
-	outMu   sync.Mutex
-	out     io.Writer = os.Stderr
+	outOnce  sync.Once
+	outMu    sync.Mutex
+	out      io.Writer     = os.Stderr
+	callsOut io.Writer     = os.Stderr // see callsPath
+	nextCall atomic.Uint64             // the last call ID given out (see walker.call)
 
 	active sync.Map // IDs of goroutines running Check, to detect re-entry
 
@@ -145,15 +148,21 @@ func Check(calls *uint32, guard bool, fn string, names []string, args []any) {
 	outOnce.Do(func() {
 		if s.Out != "" {
 			// Overwrite any output from an earlier run.
-			f, err := os.OpenFile(s.Out, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "argmatch: %v; writing to stderr instead\n", err)
-			} else {
-				out = f
+			for _, f := range []struct {
+				w    *io.Writer
+				path string
+			}{{&out, s.Out}, {&callsOut, callsPath(s.Out)}} {
+				fd, err := os.OpenFile(f.path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "argmatch: %v; writing to stderr instead\n", err)
+				} else {
+					*f.w = fd
+				}
 			}
 		}
 		outMu.Lock()
 		writeCSV(out, [][]string{header(s)})
+		writeCSV(callsOut, [][]string{callsHeader})
 		outMu.Unlock()
 	})
 	memOnce.Do(memInit)
@@ -185,6 +194,7 @@ func Check(calls *uint32, guard bool, fn string, names []string, args []any) {
 	if len(w.rows) > 0 {
 		// One write per call, so that calls' rows aren't interleaved.
 		outMu.Lock()
+		writeCSV(callsOut, [][]string{{w.call, fn, w.ancestry, w.stack}})
 		writeCSV(out, w.rows)
 		outMu.Unlock()
 	}
@@ -316,18 +326,94 @@ func writeCSV(out io.Writer, rows [][]string) {
 	out.Write(buf.Bytes())
 }
 
-// header returns the names of the output's columns. Each row has one more
-// column per step of the path from the argument down to the match: a named
-// type, or an interface ("concrete (implements interface)"). Rows have
-// different lengths, so the last header names the first of them. With exact
-// matching the haystack column is left out, since it would always equal the
-// needle.
+// header returns the names of the output's columns. call identifies the
+// call that found the match, described in the calls output (see callsPath).
+// Each row has one more column per step of the path from the argument down
+// to the match: a named type, or an interface ("concrete (implements
+// interface)"). Rows have different lengths, so the last header names the
+// first of them. With exact matching the haystack column is left out, since
+// it would always equal the needle.
 func header(s *settings.Settings) []string {
 	h := []string{"needle"}
 	if !s.Exact {
 		h = append(h, "haystack")
 	}
-	return append(h, "function", "expression", "types")
+	return append(h, "function", "expression", "call", "types")
+}
+
+// callsHeader names the columns of the calls output: one row per call that
+// found matches, written before them, giving its call ID and the goroutine
+// that made it (see splitStack).
+var callsHeader = []string{"call", "function", "ancestry", "stack"}
+
+// callsPath returns the file the calls output goes to when the matches go to
+// out: out with ".calls" before its extension (matches.calls.csv for
+// matches.csv). Without an output file, both go to stderr.
+func callsPath(out string) string {
+	ext := filepath.Ext(out)
+	return strings.TrimSuffix(out, ext) + ".calls" + ext
+}
+
+// goroutineStack returns runtime.Stack's output for the calling goroutine,
+// whole.
+func goroutineStack() string {
+	buf := make([]byte, 64<<10)
+	for {
+		n := runtime.Stack(buf, false)
+		if n < len(buf) {
+			return string(buf[:n])
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+}
+
+// splitStack splits s, runtime.Stack's output for one goroutine, into the
+// goroutine's ancestry and its stack, and leaves out the frames at the top
+// of the stack whose function skip reports true (the caller's own logging
+// frames).
+//
+// The ancestry is the goroutine's ID line without its state ("goroutine 8"),
+// followed by the rest of s from its "created by" line: where the goroutine
+// was created, and, with GODEBUG=tracebackancestors=N, the stacks of its
+// ancestors when they created their children ("[originating from goroutine
+// 7]:" sections). It's the same at every point in the goroutine, so it can
+// be used to join records made in the same goroutine. The stack is s's
+// first line and the frames before "created by", i.e. what the goroutine is
+// running.
+//
+// The ConfTamer patch to net/http (conftamer/contexttrack/go-inlibrary.patch,
+// conftamerSplitStack) splits its events' stacks in the same way, so the
+// ancestries in the two outputs can be compared; keep the two in step.
+func splitStack(s string, skip func(fn string) bool) (ancestry, stack string) {
+	first, rest, _ := strings.Cut(s, "\n")
+	id, _, _ := strings.Cut(first, " [")
+	frames, lineage := rest, ""
+	if i := strings.Index("\n"+rest, "\ncreated by "); i >= 0 {
+		frames, lineage = rest[:i], rest[i:]
+	}
+	// Each frame is a function line, e.g. "main.f(0x1, ...)", then a file
+	// line.
+	for frames != "" {
+		fn, after, _ := strings.Cut(frames, "\n")
+		if i := strings.LastIndex(fn, "("); i >= 0 {
+			fn = fn[:i]
+		}
+		if !skip(fn) {
+			break
+		}
+		_, frames, _ = strings.Cut(after, "\n")
+	}
+	ancestry = id
+	if lineage = strings.TrimRight(lineage, "\n"); lineage != "" {
+		ancestry += "\n" + lineage
+	}
+	return ancestry, first + "\n" + strings.TrimRight(frames, "\n")
+}
+
+// isRT reports whether fn, a function named as in a stack trace, is in this
+// package (Check, the walker), which the instrumented function called.
+func isRT(fn string) bool {
+	return strings.HasPrefix(fn, "argmatch/rt.")
 }
 
 const (
@@ -354,6 +440,10 @@ type walker struct {
 	expr []byte // source expression of the current value, e.g. o.P.Name
 	path []step // named types and interfaces on the path to it
 	rows [][]string
+
+	// The call's ID, unique in the process, and its goroutine (see
+	// splitStack), found when the first match is reported.
+	call, ancestry, stack string
 
 	// The budget (MaxTime, MaxMem). Once exceeded is set, every read fails.
 	started  time.Time
@@ -621,7 +711,11 @@ func (w *walker) report(val, needle string) {
 	if !w.Exact {
 		r = append(r, escape(val))
 	}
-	r = append(r, w.fn, string(w.expr))
+	if w.call == "" {
+		w.call = strconv.FormatUint(nextCall.Add(1), 10)
+		w.ancestry, w.stack = splitStack(goroutineStack(), isRT)
+	}
+	r = append(r, w.fn, string(w.expr), w.call)
 	for _, s := range w.path {
 		r = append(r, s.String())
 	}

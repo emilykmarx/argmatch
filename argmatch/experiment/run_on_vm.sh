@@ -75,7 +75,7 @@ load=$(( $(date +%s) - t )); log "loaded in ${load}s"
 # before the new one starts.
 kubectl --context $CTX scale deploy/prometheus-meta --replicas=0 > /dev/null
 kubectl --context $CTX wait --for=delete pod -l app=prometheus-meta --timeout=600s > /dev/null 2>&1 || true
-sudo rm -f $OUTDIR/matches.csv
+sudo rm -f $OUTDIR/matches.csv $OUTDIR/matches.calls.csv
 start=$(date +%s)
 kubectl --context $CTX scale deploy/prometheus-meta --replicas=1 > /dev/null
 log "prometheus-meta restarted"
@@ -130,8 +130,10 @@ while :; do
 done
 captured=$(( $(date +%s) - start ))
 # Copy the output now, so it's what argmatch had written by $captured.
-sudo cp $OUTDIR/matches.csv $dir/matches.csv 2>/dev/null || : > $dir/matches.csv
-sudo chown $(id -u):$(id -g) $dir/matches.csv
+for f in matches.csv matches.calls.csv; do
+    sudo cp $OUTDIR/$f $dir/$f 2>/dev/null || : > $dir/$f
+    sudo chown $(id -u):$(id -g) $dir/$f
+done
 if [ -n "${reload_pid:-}" ]; then
     # Let it finish (it restores the config map), but not forever: a reload
     # can block for minutes while slow checks run. Killing it still restores
@@ -151,7 +153,9 @@ fi
 
 # 5. Save the pod's log (the output was copied above).
 kubectl --context $CTX logs --timestamps deploy/prometheus-meta -c prometheus > $dir/pod.log 2>&1 || true
-rows=$(( $(wc -l < $dir/matches.csv) - 1 ))
+# CSV rows, not lines (a field can span lines): a row ends at a newline
+# after an even number of quotes, since quotes in a field are doubled.
+rows=$(awk '{ q += gsub(/"/, "\"") } q % 2 == 0 { n++ } END { print n - 1 }' $dir/matches.csv)
 # Seconds between argmatch's last check and the capture.
 last=$(grep ' argmatch-stats: ' $dir/pod.log | tail -1 | cut -d' ' -f1)
 last_check=never

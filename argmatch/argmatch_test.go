@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/csv"
 	"fmt"
 	"os"
 	"os/exec"
@@ -214,6 +215,45 @@ func TestMaxCalls(t *testing.T) {
 	}
 }
 
+// TestAncestry checks the calls output for a function called in a
+// goroutine: its call ID is the match's, the ancestry is the goroutine's ID
+// and where it was created, with GODEBUG=tracebackancestors its creator's
+// stack too, and the stack starts at the instrumented function, not
+// argmatch's own code.
+func TestAncestry(t *testing.T) {
+	e := buildExample(t, "-func", "main.InGoroutine", "-match", "needle")
+	raw, _ := e.runRaw(t, "GODEBUG=tracebackancestors=10")
+	rows := readCSV(t, raw)
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows; want a header and one match:\n%s", len(rows), raw)
+	}
+	if want := []string{"needle", "function", "expression", "call", "types"}; !slices.Equal(rows[0], want) {
+		t.Fatalf("header %q, want %q", rows[0], want)
+	}
+	data, err := os.ReadFile(filepath.Join(e.tmp, "out.calls.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := readCSV(t, string(data))
+	if want := []string{"call", "function", "ancestry", "stack"}; len(calls) != 2 || !slices.Equal(calls[0], want) {
+		t.Fatalf("calls output:\n%s\nwant header %q and one call", data, want)
+	}
+	if calls[1][0] != rows[1][3] || calls[1][1] != "main.InGoroutine" {
+		t.Errorf("call %q of %s, want the match's call %q of main.InGoroutine", calls[1][0], calls[1][1], rows[1][3])
+	}
+	ancestry, stack := calls[1][2], calls[1][3]
+	id, lineage, _ := strings.Cut(ancestry, "\n")
+	if !strings.HasPrefix(id, "goroutine ") || strings.Contains(id, "[") ||
+		!strings.HasPrefix(lineage, "created by main.main in goroutine 1\n") ||
+		!strings.Contains(lineage, "\n[originating from goroutine 1]:\nmain.main(") {
+		t.Errorf("ancestry:\n%s\nwant goroutine N, created by main.main in goroutine 1, then main's stack", ancestry)
+	}
+	if !strings.HasPrefix(stack, id+" [running]:\nmain.InGoroutine(") || strings.Contains(stack, "argmatch/rt.") ||
+		strings.Contains(stack, "created by") {
+		t.Errorf("stack:\n%s\nwant %s's running frames, starting at main.InGoroutine", stack, id)
+	}
+}
+
 // TestIgnoreClosuresDefault checks that by default the variables captured
 // by func values aren't checked: G's only matches are through closures.
 func TestIgnoreClosuresDefault(t *testing.T) {
@@ -374,6 +414,46 @@ func (e *example) goBuild(t *testing.T, goFlags []string, flags ...string) strin
 // the matches it wrote and its stderr.
 func (e *example) run(t *testing.T, env ...string) (matches, stderr string) {
 	t.Helper()
+	raw, stderr := e.runRaw(t, env...)
+	return withoutCall(t, raw), stderr
+}
+
+// readCSV parses CSV data whose rows can differ in length.
+func readCSV(t *testing.T, data string) [][]string {
+	t.Helper()
+	r := csv.NewReader(strings.NewReader(data))
+	r.FieldsPerRecord = -1
+	rows, err := r.ReadAll()
+	if err != nil {
+		t.Fatalf("not CSV: %v\n%s", err, data)
+	}
+	return rows
+}
+
+// withoutCall returns the CSV matches without the call column, whose IDs
+// depend on the order of calls. TestAncestry checks it.
+func withoutCall(t *testing.T, matches string) string {
+	t.Helper()
+	rows := readCSV(t, matches)
+	if len(rows) == 0 {
+		return matches
+	}
+	drop := slices.Index(rows[0], "call")
+	if drop < 0 {
+		t.Fatalf("no call column in header %q", rows[0])
+	}
+	var b strings.Builder
+	w := csv.NewWriter(&b)
+	for _, row := range rows {
+		w.Write(slices.Delete(row, drop, drop+1))
+	}
+	w.Flush()
+	return b.String()
+}
+
+// runRaw is like run, but leaves the call column in.
+func (e *example) runRaw(t *testing.T, env ...string) (matches, stderr string) {
+	t.Helper()
 	cmd := exec.Command(e.exe)
 	cmd.Dir = e.tmp
 	cmd.Env = append(os.Environ(), env...)
@@ -443,7 +523,7 @@ func TestMaps(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := strings.Split(strings.TrimSpace(string(data)), "\n")
+	got := strings.Split(strings.TrimSpace(withoutCall(t, string(data))), "\n")
 	slices.Sort(got)
 	want := []string{
 		`needle,function,expression,types`,

@@ -9,7 +9,9 @@ The functions and needles, and three settings:
 - **Needles:** `prometheus/argmatch-matches.txt`, a copy of `prom-test-infra/prombench/param_values.txt`. That's 158 config values; `param_keys.txt` maps each to its config keys.
 - **Settings:** `RECVONLY=1`, `EXACT=true`, `IGNORECLOSURES=true`.
 
-## Runs so far
+## Runs before the sweep
+
+**Best so far:** `MAXCALLS` 30, from the sweep below (depth 10, `MAXELEMS` 64, ignoring none, 360 s, viewer and reloads). Its two runs got 1,739 pairs, 137 needles and 38 types (`sweep-c30-1`, the best single run), and 1,387, 130 and 38 (`sweep-c30-2`). Both are above every other setting's runs. The gap between them is the 7 needles that depend on startup timing (see the sweep section).
 
 Pairs are rows of `needle_types.csv`: unique (needle, receiver type) pairs. "Ignoring none" means `IGNORELIBS=false IGNORETYPES= MAXMEM=0 MAXTIME=0`; the walker is the raw-memory one on `main` unless noted.
 
@@ -22,7 +24,7 @@ Pairs are rows of `needle_types.csv`: unique (needle, receiver type) pairs. "Ign
 | `main-d10-e64-c3` | same, ignoring none | first alert (43 s) | 1,097 | 123 | 28 |
 | `watch-d10-e64-c3` | same | sampled to 9.6 min | 1,005 | 125 | 33 |
 | `view-d10-e64-c3` | same | 150 s, dashboard viewer | 1,331 | 127 | 34 |
-| **`reload-d10-e64-c3`** (best so far) | same | 240 s, viewer and config reloads | 1,298 | 130 | 35 |
+| `reload-d10-e64-c3` (the sweep's starting point) | same | 240 s, viewer and config reloads | 1,298 | 130 | 35 |
 
 The `reflect-port` builds read the same values as `main`; only `MAXFIELDS`, `IGNORELIBS`, `IGNORETYPES`, `MAXMEM` and `MAXTIME` were missing there.
 
@@ -45,17 +47,15 @@ The `reflect-port` builds read the same values as `main`; only `MAXFIELDS`, `IGN
 
 ## Needles that weren't matched
 
-`reload-d10-e64-c3` matched 130 of 158 needles. Of the 28 it missed, most can't be matched exactly under the fixed settings, because Prometheus doesn't keep the config's string:
+`reload-d10-e64-c3` matched 130 of 158 needles. Of the 28 it missed, most can't be matched exactly under the fixed settings, because Prometheus doesn't keep the config's string as it is. They fall into these groups ([STRINGISH_TYPES.md](STRINGISH_TYPES.md) explains how Prometheus decodes each type):
 
-| Needles | Why not, with `EXACT=true` |
-|---|---|
-| 11 relabel and metric regexes, e.g. `(.+)`, `^$`, `go_gc_.+`, `up\|scrape_.+`, `prombench-(\d+);test-pr-\d+` | Kept as compiled regexps, whose stored source is anchored, e.g. `^(?s:(.+))$` |
-| `TLS12`, `TLS13` | Parsed into numeric TLS versions |
-| `http://127.0.0.1:3128`, `https://kubernetes.default.svc:443` | Parsed into URL structs |
-| `10.0.0.0/8`, `172.16.0.0/12`, `.svc`, `.cluster.local` | `no_proxy` entries, probably kept joined into one string, or parsed |
-| The PEM certificate and private key | The needles contain escaped `\n`, while the stored values have real newlines |
-
-These would need needles in their runtime form, or `EXACT=false`.
+| Needles | How Prometheus stores them | Would `EXACT=false` match? |
+|---|---|---|
+| `TLS12`, `TLS13` | **Not as a string:** `config.TLSVersion`, a `uint16`. argmatch only compares strings, `[]byte` and byte arrays. | No. Nothing would, short of comparing numbers. |
+| 11 relabel and metric regexes, e.g. `(.+)`, `^$`, `go_gc_.+`, `up\|scrape_.+`, `prombench-(\d+);test-pr-\d+` | **A string that contains the needle:** `relabel.Regexp` compiles `^(?s:` + needle + `)$`, and `regexp.Regexp` keeps that text (e.g. `^(?s:(.+))$`). | Yes: it reports values that contain a needle. |
+| `http://127.0.0.1:3128`, `https://kubernetes.default.svc:443` | **Strings that the needle contains:** `config.URL` holds a `*url.URL` with the parts in separate fields (`Scheme` `http`, `Host` `127.0.0.1:3128`). | No: no stored string contains the whole needle. It would need needles split into their parts. |
+| `10.0.0.0/8`, `172.16.0.0/12`, `.svc`, `.cluster.local` | `no_proxy` entries, probably kept joined into one string, or parsed. Not checked. | Yes if they're kept joined into one string. |
+| The PEM certificate and private key | The needles contain escaped `\n`, while the stored values have real newlines. | No, but needles with real newlines would match exactly. |
 
 The rest might be reachable with other settings:
 - `/data/scrape_failures.log`, `/etc/prometheus/alerts/*.yml`, `/etc/prometheus/config/scrape_config_*.yml`
@@ -74,7 +74,7 @@ These are top-level config fields, held in the loaded `config.Config`. With `REC
 
 ## Settings sweep (stopped after `sweep-d15-2`)
 
-Started 2026-10-29 on the VM with `sweep_on_vm.sh`, in tmux session `sweep`. Each run changes one setting from `reload-d10-e64-c3`, with the viewer and reloads on and a 240 s wait (360 s for the `MAXCALLS` runs). Results are on the VM in `argmatch-experiment/summary.tsv` and `sweep-*/`. Stopped at 03:01 UTC: `sweep-d15-2` was stuck like `sweep-d15-1` and was killed, and the `DEPTH` 20 and `MAXELEMS` 256 runs weren't started.
+Started 2026-10-29 on the VM with `sweep_on_vm.sh`, in tmux session `sweep`. Each run changes one setting from `reload-d10-e64-c3`, with the viewer and reloads on and a 240 s wait (360 s for the `MAXCALLS` runs). Results are in `dump_ancestors/argmatch-experiment/summary.tsv` and `sweep-*/`, copied from the VM before it was shut down, without the raw `matches.csv` files (48 GB). Stopped at 03:01 UTC: `sweep-d15-2` was stuck like `sweep-d15-1` and was killed, and the `DEPTH` 20 and `MAXELEMS` 256 runs weren't started.
 
 | Run | Change | Pairs | Needles | Types | Notes |
 |---|---|---|---|---|---|
@@ -85,6 +85,8 @@ Started 2026-10-29 on the VM with `sweep_on_vm.sh`, in tmux session `sweep`. Eac
 | `sweep-c30-2` | `MAXCALLS` 30 | 1,387 | 130 | 38 | missed the 7: all 30 `testReady` calls came before the config was loaded; `still_checking=yes`, last check 350 s after restart |
 | `sweep-d15-1` | `DEPTH` 15 | — | — | — | failed: hit the sweep's 1,200 s timeout before capturing; `matches.csv` was over 29.5 GB |
 | `sweep-d15-2` | `DEPTH` 15 | — | — | — | killed after 12 minutes: ready after 131 s, first config reload blocked for 7.5 minutes |
+| `sweep-c30-i5-1` | `MAXCALLS` 30, `CALLINTERVAL` 5s | 1,307 | 130 | 32 | 1,021 checks (`sweep-c30-2`: 1,322); lost 6 client-go types; `still_checking=yes` |
+| `sweep-c30-i5-2` | `MAXCALLS` 30, `CALLINTERVAL` 5s | 1,264 | 130 | 30 | repeats `sweep-c30-i5-1`'s drop; `still_checking=yes` |
 
 - **Variation at the baseline is small:** `sweep-base-1` matches `reload-d10-e64-c3` (1,298 pairs, 130 needles, 35 types) within 1%. Same settings, wait and simulated use. The earlier 10–20% differences were mostly between runs that also differed in wait or extras.
 - **`MAXCALLS` 10, both runs:** 1,342 and 1,363 pairs, the same 38 types in both. That's a small but repeatable gain over the baseline (1,298–1,305 pairs, 34–35 types).
@@ -92,13 +94,19 @@ Started 2026-10-29 on the VM with `sweep_on_vm.sh`, in tmux session `sweep`. Eac
   - The 4 new types are all from client-go's Kubernetes discovery: `gentype.Client[*v1.Pod]`, `gentype.alsoLister[*v1.Endpoints,...]`, `cache.controller`, `cache.sharedIndexInformer`. No types were lost.
   - **`still_checking=yes` here doesn't mean it was still finding things.** The checks after 2 minutes were periodic: notifier sends, DNS refreshes and dashboard queries, then client-go watches being re-established (the last check, at 343 s). With `MAXCALLS` 10, such periodic functions keep being checked for minutes. A longer wait would mostly add more of the same.
 - **`MAXCALLS` 30 reaches the 7 top-level config needles** (`/data/scrape_failures.log`, the two config globs, the 3 OTLP settings, `OpenMetricsText0.0.1`). It's a jump to 1,739 pairs and 137 needles, with the same 38 types as `MAXCALLS` 10.
-  - **All 7 are found only through `web.Handler`, in `web.(*Handler).testReady`,** the readiness wrapper around every HTTP request. That confirms the guess under "Needles that weren't matched".
-  - **What matters is how many calls happen before the config is loaded.** In `sweep-c30-1`, `testReady` was called 25 times in the 6 s before the config was loaded, finding 61–68 rows each. Calls 26–30 came after, finding 1,348 rows, then 6,044 to 14,063 rows each. In `sweep-c10-2` all 10 calls happened before the config was loaded.
-  - **So it depends on timing.** The number of calls before the config is loaded depends on how long startup takes, and on the HTTP requests that arrive meanwhile (probes, scrapes of prometheus-meta). A run with a slower start could use up 30 calls before then and miss the 7 needles.
-  - **That's what happened in `sweep-c30-2`.** The config took 11 s to load, against 6 s in `sweep-c30-1`. `testReady` was checked back to back, about 5 times a second (each check takes about 0.2 s), so all 30 calls happened in the 6 s before the config loaded, finding 177–219 rows each. Without those 7 needles it's 1,387 pairs, close to `MAXCALLS` 10.
-  - **So a higher `MAXCALLS` alone isn't a reliable way to get them.** The number needed scales with startup time (about 5 calls per second of startup), and every extra call of the periodic functions makes the output bigger.
-  - **Possible argmatch change:** let checks of a function be spread out in time, for example at most one check per function every N seconds, or a check on the first call and then on calls at increasing intervals. With a gap of a few seconds, the first handful of `testReady` checks would cover the time after the config loaded, whatever the startup time.
-  - **Implemented locally as `-callinterval`** (`CALLINTERVAL`, a duration, default 0), uncommitted. After a function is checked, its calls in the next interval aren't checked and don't count towards `MAXCALLS`. It's a run-time setting, so changing it only relinks. It won't reach the VM until the sweep ends. To try next: `MAXCALLS` 30 with `CALLINTERVAL` 5s, twice, against `sweep-c30-*`.
+  - **All 7 are found only through `web.Handler`, in `web.(*Handler).testReady`.** That confirms the guess under "Needles that weren't matched".
+  - **`testReady` only runs at startup.** It isn't the readiness check on each request: it wraps a route's handler, and is called once per route when the routes are registered (in `web.New` and `api_v1.(*API).Register`, about 40 routes). The closure it returns is what runs on each request, and it isn't instrumented separately.
+  - **So the 7 needles appear only when route registration overlaps the config being loaded,** and that's caused by argmatch itself. Each `testReady` check takes about 0.2 s, which slows the registration down, so the last routes can be registered after the config is loaded. Without argmatch, registration takes milliseconds.
+    - In `sweep-c30-1`, calls 1–25 came in the 6 s before the config was loaded (61–68 rows each). Calls 26–30 came after (1,348, then 6,044 to 14,063 rows each).
+    - In `sweep-c30-2`, the config took 11 s to load instead of 6, and all 30 checked calls came before it (177–219 rows each). Without the 7 needles, it got 1,387 pairs, close to `MAXCALLS` 10.
+    - In `sweep-c10-2`, all 10 calls came before the config was loaded.
+  - **Getting them reliably** would need `testReady` to be checked on all its calls (about 40), so `MAXCALLS` of at least 40, but even that depends on startup timing. Or it would need an instrumented function that gets the `web.Handler` later on. With `RECVONLY` and the fixed function list, there doesn't seem to be one.
+  - **`-callinterval` doesn't help here.** It was added (argmatch commit 4ce9ea1) on the wrong assumption that `testReady` runs on every request. After a function is checked, its calls within the interval aren't checked and don't count towards `MAXCALLS`. All of `testReady`'s calls come within a few seconds, so with `CALLINTERVAL` 5s only the first is checked. That's confirmed in `sweep-c30-i5-1`: one `testReady` check, at startup. The setting still spreads out the checks of periodic functions, which the `sweep-c30-i5-*` runs measure.
+- **`CALLINTERVAL` 5s (with `MAXCALLS` 30) is worse, not better:** 1,307 and 1,264 pairs, 32 and 30 types in the two runs, against 1,387 and 38 in `sweep-c30-2`.
+  - **The interval is per function, not per receiver.** Many functions are called in a burst on different receivers: one call per informer (`sharedIndexInformer.Run`, `ListWatch.List`: 9 calls → 1), per scrape loop (`scrapeLoop.run`: 30 → 3), per remote-write shard (`shards.runShard`: 14 → 4), per route (`testReady`, `Router.handle`: 30 → 1). Only the first call of each burst is checked.
+  - **The 6 types lost** are client-go's informers for Endpoints and Nodes: `gentype.Client[*v1.Endpoints]`, `gentype.Client[*v1.Node]`, the two `alsoLister`s, `cache.controller`, `cache.sharedIndexInformer`. Only one informer's calls were checked.
+  - No function was checked more often than in `sweep-c30-2`. Truly periodic functions, like DNS refreshes, were checked about as often as without the interval.
+  - **A per-receiver interval** (keyed by the function and its receiver's address) would keep the bursts and still spread out repeated calls on the same receiver. It wouldn't help `testReady` (one `web.Handler`). Not implemented.
   - **These later calls are expensive:** about 2 s and 14,000 raw rows each. That's most of the jump in raw rows, from 1.6 million to 5.7 million.
   - **Analysis cost:** at `MAXCALLS` 30, `matches.csv` is about 4 GB. Analyzing a run took about 10 minutes, so each run took 18 minutes instead of 8. `stats.py` alone used 31 GB of memory, because it parsed the whole file just to count rows. Locally, `stats.py` now takes the count from `run_on_vm.sh` instead; that change won't reach the VM until the sweep ends.
 - **`DEPTH` 15 (with `MAXELEMS` 64, `MAXCALLS` 3) is too expensive to run.**

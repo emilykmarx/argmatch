@@ -224,3 +224,5 @@ argmatch decides what to instrument when the program is compiled (from a stack l
 1. contexttrack records chains, while argmatch does nothing
 2. argmatch instruments the functions recorded in the first run
      - [events_to_stacklog.py](events_to_stacklog.py) parses events into a stack log
+
+For an example, see [bootstrap-example](bootstrap-example), which builds Prometheus and runs it twice in a standalone container with a workload including scrapes, queries, and config reload.

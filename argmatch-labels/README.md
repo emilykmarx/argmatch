@@ -109,7 +109,7 @@ older frames</pre>
 <pre> goroutine 486 [running]:
  net/http.(*Client).Do(...)
   /usr/local/go/src/net/http/client.go:593
-<span class="scrape"> scrape.(*targetScraper).scrape(...)
+<span class="scrape"> scrape.(*targetScraper).scrape(...) 🟧
   /src/scrape/scrape.go:820</span>
  scrape.(*scrapeLoop).scrapeAndReport(...)
   /src/scrape/scrape.go:1426
@@ -134,7 +134,7 @@ scrape.(*Manager).reloader(...)
 created by scrape.(*Manager).Run
   /src/scrape/manager.go:122
 [originating from goroutine 339]:
-<span class="run"> scrape.(*Manager).Run(...)
+<span class="run"> scrape.(*Manager).Run(...) 🟪
   /src/scrape/manager.go:122</span>
 main.main.func17(...)
   /src/cmd/prometheus/main.go:1082
@@ -157,7 +157,7 @@ main.main.func34(...)
 
 <span class="rowhead">targetScraper.scrape</span>
 goroutine 486 [running]:
-<span class="scrape">scrape.(*targetScraper).scrape(...)
+<span class="scrape">scrape.(*targetScraper).scrape(...) 🟧
   /src/scrape/scrape.go:806</span>
 scrape.(*scrapeLoop).scrapeAndReport(...)
   /src/scrape/scrape.go:1426
@@ -182,7 +182,7 @@ scrape.(*scrapeLoop).run(...)
 
 <span class="rowhead">Manager.Run</span>
 goroutine 339 [running]:
-<span class="run">scrape.(*Manager).Run(...)
+<span class="run">scrape.(*Manager).Run(...) 🟪
   /src/scrape/manager.go:121</span>
 main.main.func17(...)
   /src/cmd/prometheus/main.go:1082

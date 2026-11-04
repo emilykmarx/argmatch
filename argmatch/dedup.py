@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """Deduplicate and group/sort the CSV output of one argmatch run.
 
-Usage: dedup.py [input.csv] > output.csv
+Usage: dedup.py [--keep-call] [input.csv] > output.csv
 
 Reads the CSV argmatch wrote (from the file, or stdin if none is given) and
 writes it to stdout with duplicate rows removed, keeping the header. Rows are
 compared whole, except that map positions in the expression column are
-ignored (see below). The call column is left out of the output: it
-identifies the call that found each match, so it'd keep the same match found
-by different calls from being merged.
+ignored (see below). The call column, which identifies the call that found
+each match, is left out of the output, so that the same match found by
+different calls is one row. With --keep-call it's kept, so that rows can be
+joined with the calls output (matches.calls.csv), and the same match found by
+different calls stays one row per call. Most duplicates are usually the same
+match found again by a later call (in one Prometheus run, deduplicating left
+10% of the rows without the call column, but 98% with it), so with
+--keep-call the output may not be much smaller than the input.
 
 The output is grouped by needle, and the groups are ordered by how many
 distinct haystacks the needle matched, fewest first, then by the needle's
@@ -22,12 +27,12 @@ groups are just sorted by needle), and with closures ignored there's no closure
 column.
 """
 
+import argparse
 import csv
 import io
 import re
 import sys
 
-USAGE = "usage: dedup.py [input.csv] > output.csv"
 
 # A map entry whose key isn't a string, integer or bool is named by its
 # position in the map, e.g. m[<key 3>] or m<key 3>, not by its key. A string
@@ -90,10 +95,14 @@ def write_csv(rows, out):
 
 
 def main():
-    if len(sys.argv) > 2:
-        sys.exit(USAGE)
-    if len(sys.argv) == 2:
-        with open(sys.argv[1], "rb") as f:
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("input", nargs="?", help="argmatch's CSV (default: stdin)")
+    p.add_argument("--keep-call", action="store_true",
+                   help="keep the call column, to join the output with the calls output; the same match "
+                        "found by different calls then stays one row per call, so the output may not be much smaller")
+    args = p.parse_args()
+    if args.input:
+        with open(args.input, "rb") as f:
             data = f.read()
     else:
         data = sys.stdin.buffer.read()
@@ -101,7 +110,7 @@ def main():
     header = next(rows, None)
     if header is None:
         return
-    if "call" in header:
+    if "call" in header and not args.keep_call:
         call = header.index("call")
         rows = (row[:call] + row[call + 1:] for row in rows)
         header = header[:call] + header[call + 1:]

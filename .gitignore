@@ -4,3 +4,6 @@
 
 # Python bytecode (needle_types.py imports dedup.py)
 __pycache__/
+
+# Written by the instrumented prometheus-meta in prombench (mounted at /argmatch-out)
+argmatch-out/

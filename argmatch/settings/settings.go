@@ -162,8 +162,10 @@ func (s *Settings) FromEnv() (used []string, err error) {
 
 // LoadNeedles returns match and the lines of the file at path (if path
 // isn't "") that are neither blank nor comments (starting with #), without
-// duplicates. Each line is used as is, apart from a trailing \r. path must
-// be absolute.
+// duplicates. Each line is used as is, apart from a trailing \r and a
+// literal \n, which stands for a newline (so that a line can hold a
+// multi-line string, as paramtrack's configkeys writes them). path must be
+// absolute.
 func LoadNeedles(match, path string) ([]string, error) {
 	var ns []string
 	if match != "" {
@@ -178,7 +180,7 @@ func LoadNeedles(match, path string) ([]string, error) {
 			return nil, err
 		}
 		for line := range strings.SplitSeq(string(data), "\n") {
-			line = strings.TrimSuffix(line, "\r")
+			line = strings.ReplaceAll(strings.TrimSuffix(line, "\r"), `\n`, "\n")
 			if line != "" && !strings.HasPrefix(line, "#") && !slices.Contains(ns, line) {
 				ns = append(ns, line)
 			}

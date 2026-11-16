@@ -1,6 +1,9 @@
 package settings
 
 import (
+	"os"
+	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 )
@@ -67,5 +70,23 @@ func TestFromEnv(t *testing.T) {
 	want.IgnoreTypes = []string{"a.T", "b.U"}
 	if s.Encode() != want.Encode() {
 		t.Errorf("got %+v, want %+v", s, want)
+	}
+}
+
+// TestLoadNeedles checks that a -matchfile line's literal \n stands for a
+// newline, and the other lines are used as is.
+func TestLoadNeedles(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "matches.txt")
+	data := "# comment\nplain\n\n-----BEGIN CERT-----\\nAAA\\n-----END CERT-----\\n\nprombench-(\\d+)\r\nplain\n"
+	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadNeedles("m", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"m", "plain", "-----BEGIN CERT-----\nAAA\n-----END CERT-----\n", `prombench-(\d+)`}
+	if !slices.Equal(got, want) {
+		t.Errorf("LoadNeedles: %q, want %q", got, want)
 	}
 }

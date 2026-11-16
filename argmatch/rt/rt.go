@@ -707,7 +707,7 @@ func (w *walker) matches(s, needle string) bool {
 }
 
 func (w *walker) report(val, needle string) {
-	r := []string{needle}
+	r := []string{needleColumn(needle)}
 	if !w.Exact {
 		r = append(r, escape(val))
 	}
@@ -954,6 +954,12 @@ func (w *walker) stringValue(t reflect.Type, b []byte) (string, bool) {
 // backslashes escaped as in a Go string literal (e.g. \x00, \n, \\), so
 // that a haystack from a binary buffer stays readable text. Printable
 // characters, including non-ASCII ones and quotes, are left as is.
+// needleColumn is a needle as the output names it: as -matchfile writes it,
+// with each newline a literal \n (settings.LoadNeedles).
+func needleColumn(needle string) string {
+	return strings.ReplaceAll(needle, "\n", `\n`)
+}
+
 func escape(s string) string {
 	var b strings.Builder
 	for len(s) > 0 {

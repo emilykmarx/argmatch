@@ -21,7 +21,7 @@ The settings can also come from the environment, which is how to use it with a b
 ARGMATCH_FUNC=main.ID.F ARGMATCH_MATCH=needle ARGMATCH_DEPTH=5 ARGMATCH_OUT=/tmp/argmatch.txt GOFLAGS=-toolexec=$A go build .
 ```
 
-To check against several strings, put them in a file, one per line, and pass it with `-matchfile` (env `ARGMATCH_MATCHFILE`). Every value is checked against every string, and each output line names the string that matched. `-matchfile` can be combined with `-match`. The file's path must be absolute, because the go command runs the wrapper in each package's directory. Lines are used exactly as written, including leading and trailing spaces; blank lines and lines starting with `#` are ignored, so a match string can't start with `#`. The strings are read at build time and linked into the program, so after editing the file, rebuild (which only relinks) or override them when the program runs (see "How it works").
+To check against several strings, put them in a file, one per line, and pass it with `-matchfile` (env `ARGMATCH_MATCHFILE`). Every value is checked against every string, and each output line names the string that matched. `-matchfile` can be combined with `-match`. The file's path must be absolute, because the go command runs the wrapper in each package's directory. Lines are used exactly as written, including leading and trailing spaces, except that a literal `\n` stands for a newline (so a line can hold a multi-line string, e.g. a PEM certificate; a match string can't contain a literal backslash followed by `n`); blank lines and lines starting with `#` are ignored, so a match string can't start with `#`. The strings are read at build time and linked into the program, so after editing the file, rebuild (which only relinks) or override them when the program runs (see "How it works").
 
 ```sh
 printf 'needle\needl\n' > /tmp/matches.txt
@@ -52,7 +52,7 @@ Matches are written as CSV, one row per match, with these columns:
 
 | Column | Contents |
 |---|---|
-| `needle` | the match string |
+| `needle` | the match string, as `-matchfile` writes it (a newline as `\n`) |
 | `haystack` | only with `-exact=false`: the whole value that matched, with non-printable characters, invalid UTF-8 and backslashes escaped as in a Go string literal (`\x00`, `\n`, `\\`), since it can be a binary buffer. With exact matching it would always equal `needle`, so it's left out. |
 | `function` | the instrumented function |
 | `expression` | the path from the parameter to the value, e.g. `o.P.Name` |

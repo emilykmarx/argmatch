@@ -102,3 +102,11 @@ func TestAncestrySameInGoroutine(t *testing.T) {
 		t.Errorf("two goroutines have the same ancestry:\n%s", a[0])
 	}
 }
+
+// TestNeedleColumn checks that a needle with newlines is reported as
+// -matchfile writes it.
+func TestNeedleColumn(t *testing.T) {
+	if got, want := needleColumn("a\nb\n"), `a\nb\n`; got != want {
+		t.Errorf("needleColumn: %q, want %q", got, want)
+	}
+}

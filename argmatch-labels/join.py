@@ -19,7 +19,7 @@ lines have the same offset in both ("in goroutine N" is dropped: only the
 innermost goroutine's line has it).
 
 Writes OUT_DIR/joined.csv and prints a summary. joined.csv has columns
-message_kind, message_label (as message_graph.py labels messages) and
+message_kind, message_label (as message_graph.py labels messages, normalized: NORMALIZE) and
 needle: for each joined event and call, the event's kind and label with each
 distinct needle among the call's matches (read from matches.csv next to
 matches.calls.csv; argmatch writes the two together). Each distinct row is
@@ -81,14 +81,39 @@ def chain(stack, ancestry):
     return out
 
 
-def message_labels(events):
+# Kubernetes' random name suffixes' alphabet (k8s.io/apimachinery/pkg/util/rand: no vowels, so words rarely match)
+_K8S_RAND = "bcdfghjklmnpqrstvwxz2456789"
+_END = r"(?=[/,} ?]|$)"
+# Parts of labels that differ between runs of the same testbed and config, replaced by placeholders so that labels
+# compare across runs (2026-11-16). Names the config chooses stay: they carry config values.
+NORMALIZE = [
+    # A Deployment's pod: <deployment>-<pod template hash>-<5 chars>
+    (re.compile(rf"-[{_K8S_RAND}]{{6,10}}-[{_K8S_RAND}]{{5}}{_END}"), "-<pod>"),
+    # Another controller's pod (e.g. a DaemonSet's), under /pods/: <owner>-<5 chars>
+    (re.compile(rf"(?<=/pods/)([a-z0-9.-]+?)-[{_K8S_RAND}]{{5}}{_END}"), r"\1-<pod>"),
+    # Caddy's storage write test: caddy.ingress--rw.test.<random int>
+    (re.compile(r"(--rw\.test\.)\d+"), r"\1<n>"),
+    # Caddy's stapled OCSP responses, named for their certificate: caddy.ingress--ocsp.<name>-<cert hash>
+    (re.compile(rf"(--ocsp\.[^,}}/ ]+?-)[0-9a-f]{{6,}}{_END}"), r"\1<hash>"),
+]
+
+
+def normalize(label):
+    """label with the parts that differ between runs replaced (NORMALIZE)"""
+    for rx, sub in NORMALIZE:
+        label = rx.sub(sub, label)
+    return label
+
+
+def message_labels(events, normalized=True):
     """Return {index in events: message label} for the events message_graph.py
     treats as messages (message_graph.messages), labelled as it labels their
-    nodes."""
+    nodes, normalized (normalize) unless normalized is False."""
     msgs = message_graph.messages(events)  # the same dicts as in events
     paths = message_graph.node_path_counts(msgs)
     index = {id(ev): i for i, ev in enumerate(events)}
-    return {index[id(ev)]: message_graph._msg_label(ev, paths.get(message_graph._msg_key(ev), 0))
+    norm = normalize if normalized else (lambda label: label)
+    return {index[id(ev)]: norm(message_graph._msg_label(ev, paths.get(message_graph._msg_key(ev), 0)))
             for _, ev in msgs}
 
 

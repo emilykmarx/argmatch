@@ -37,6 +37,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"maps"
 	"os"
 	"os/exec"
@@ -56,6 +57,7 @@ const (
 	nestedEnv = "ARGMATCH_NESTED" // set while building rt's dependencies
 	checkFn   = "__argmatch_check"
 	regFn     = "__argmatch_register"
+	chansFn   = "__argmatch_register_chans"
 )
 
 // Each flag defaults to an environment variable, for use with
@@ -376,13 +378,22 @@ func compileArgs(tool string, args []string, tmp string) []string {
 			continue // let the compiler report it
 		}
 		var edits []edit
-		var fns []string // the functions instrumented in this file
+		var fns []string   // the functions instrumented in this file
+		var chans []string // the channel parameters of the functions chosen in this file (see chanParams)
+		imports := fileImports(f)
 		for _, d := range f.Decls {
 			fd, ok := d.(*ast.FuncDecl)
 			if !ok {
 				continue
 			}
 			name, explicit, ok := matchesFunc(pkg, isStd, fd)
+			if ok {
+				// Every chosen function's, instrumented or not (e.g. with
+				// -recvonly, one without a receiver isn't)
+				for _, c := range chanParams(pkg, imports, fd) {
+					chans = append(chans, strconv.Quote(name+"\t"+c))
+				}
+			}
 			if !ok || fd.Recv.NumFields() == 0 && (*recvOnly || fd.Type.Params.NumFields() == 0) {
 				continue // nothing to check
 			}
@@ -403,6 +414,10 @@ func compileArgs(tool string, args []string, tmp string) []string {
 			// called (see rt.Register).
 			edits = append(edits, edit{len(src), fmt.Sprintf("\nfunc init() { %s([]string{%s}) }\n", regFn, strings.Join(fns, ", "))})
 		}
+		if len(chans) > 0 {
+			// Likewise their channel parameters (see rt.RegisterChans)
+			edits = append(edits, edit{len(src), fmt.Sprintf("\nfunc init() { %s([]string{%s}) }\n", chansFn, strings.Join(chans, ", "))})
+		}
 		if len(edits) > 0 && !declared {
 			// The target package can't import rt (it may be one of rt's
 			// own dependencies), so refer to rt.Check and rt.Register by
@@ -411,6 +426,7 @@ func compileArgs(tool string, args []string, tmp string) []string {
 				edit{fset.Position(f.Name.End()).Offset, `; import _ "unsafe"`},
 				edit{len(src), fmt.Sprintf("\n//go:linkname %s %s.Check\nfunc %s(*uint32, bool, string, []string, []interface{})\n", checkFn, rtPkg, checkFn)},
 				edit{len(src), fmt.Sprintf("\n//go:linkname %s %s.Register\nfunc %s([]string)\n", regFn, rtPkg, regFn)},
+				edit{len(src), fmt.Sprintf("\n//go:linkname %s %s.RegisterChans\nfunc %s([]string)\n", chansFn, rtPkg, chansFn)},
 			)
 			declared = true
 		}
@@ -449,6 +465,152 @@ func compileArgs(tool string, args []string, tmp string) []string {
 type edit struct {
 	off  int
 	text string
+}
+
+// fileImports returns f's imports, by the name the file refers to each by.
+// A name that isn't given is guessed from the path, as goimports does: its
+// last element, without a major version suffix (/v2) or a gopkg.in version
+// (.v3), and after a "go-" prefix. Dot and blank imports are left out.
+func fileImports(f *ast.File) map[string]string {
+	m := map[string]string{}
+	for _, im := range f.Imports {
+		path, err := strconv.Unquote(im.Path.Value)
+		if err != nil {
+			continue
+		}
+		if im.Name != nil {
+			if im.Name.Name != "." && im.Name.Name != "_" {
+				m[im.Name.Name] = path
+			}
+			continue
+		}
+		parts := strings.Split(path, "/")
+		last := parts[len(parts)-1]
+		if len(parts) > 1 && len(last) > 1 && last[0] == 'v' && strings.Trim(last[1:], "0123456789") == "" {
+			last = parts[len(parts)-2]
+		}
+		if i := strings.Index(last, ".v"); i > 0 {
+			last = last[:i]
+		}
+		last = strings.TrimPrefix(last, "go-")
+		m[strings.ReplaceAll(last, "-", "_")] = path
+	}
+	return m
+}
+
+// chanParams returns fd's channel parameters (not its receiver's or
+// results'), each as tab-separated fields: the parameter's name ("_" if it
+// has none), its direction (send, recv or both), its element type as
+// written, and the named types in the element type, separated by ";". The
+// named types are those reachable through pointers, slices, arrays, maps
+// (keys and values), channels and generic instantiations, each as
+// <import path>.<Name> (a type of fd's own package pkg as pkg.<Name>);
+// predeclared types and fd's type parameters aren't named types here, and a
+// package the file doesn't import by that name gives ?<name>.<Name>. It's
+// syntax only: a parameter whose type is a named channel type (type C chan
+// T) isn't found.
+func chanParams(pkg string, imports map[string]string, fd *ast.FuncDecl) []string {
+	typeParams := map[string]bool{}
+	for _, fl := range []*ast.FieldList{fd.Type.TypeParams, recvTypeParams(fd)} {
+		if fl == nil {
+			continue
+		}
+		for _, field := range fl.List {
+			for _, n := range field.Names {
+				typeParams[n.Name] = true
+			}
+		}
+	}
+	var out []string
+	for _, field := range fd.Type.Params.List {
+		ct, ok := field.Type.(*ast.ChanType)
+		if !ok {
+			continue
+		}
+		dir := map[ast.ChanDir]string{ast.SEND: "send", ast.RECV: "recv", ast.SEND | ast.RECV: "both"}[ct.Dir]
+		named := slices.Compact(slices.Sorted(maps.Keys(namedTypes(ct.Value, pkg, imports, typeParams))))
+		elem := types.ExprString(ct.Value)
+		names := []string{"_"}
+		if len(field.Names) > 0 {
+			names = names[:0]
+			for _, n := range field.Names {
+				names = append(names, n.Name)
+			}
+		}
+		for _, n := range names {
+			out = append(out, strings.Join([]string{n, dir, elem, strings.Join(named, ";")}, "\t"))
+		}
+	}
+	return out
+}
+
+// recvTypeParams returns the type parameters a generic method's receiver
+// names (T in func (r *R[T]) M), as a field list, or nil.
+func recvTypeParams(fd *ast.FuncDecl) *ast.FieldList {
+	if fd.Recv == nil || len(fd.Recv.List) != 1 {
+		return nil
+	}
+	typ := fd.Recv.List[0].Type
+	if s, ok := typ.(*ast.StarExpr); ok {
+		typ = s.X
+	}
+	var idx []ast.Expr
+	switch t := typ.(type) {
+	case *ast.IndexExpr:
+		idx = []ast.Expr{t.Index}
+	case *ast.IndexListExpr:
+		idx = t.Indices
+	}
+	fl := &ast.FieldList{}
+	for _, e := range idx {
+		if id, ok := e.(*ast.Ident); ok {
+			fl.List = append(fl.List, &ast.Field{Names: []*ast.Ident{id}})
+		}
+	}
+	return fl
+}
+
+// namedTypes returns the named types in type expression e (see chanParams).
+func namedTypes(e ast.Expr, pkg string, imports map[string]string, typeParams map[string]bool) map[string]bool {
+	out := map[string]bool{}
+	var walk func(ast.Expr)
+	walk = func(e ast.Expr) {
+		switch t := e.(type) {
+		case *ast.Ident:
+			if !typeParams[t.Name] && types.Universe.Lookup(t.Name) == nil {
+				out[pkg+"."+t.Name] = true
+			}
+		case *ast.SelectorExpr:
+			if x, ok := t.X.(*ast.Ident); ok {
+				if path, ok := imports[x.Name]; ok {
+					out[path+"."+t.Sel.Name] = true
+				} else {
+					out["?"+x.Name+"."+t.Sel.Name] = true
+				}
+			}
+		case *ast.StarExpr:
+			walk(t.X)
+		case *ast.ArrayType:
+			walk(t.Elt)
+		case *ast.MapType:
+			walk(t.Key)
+			walk(t.Value)
+		case *ast.ChanType:
+			walk(t.Value)
+		case *ast.ParenExpr:
+			walk(t.X)
+		case *ast.IndexExpr:
+			walk(t.X)
+			walk(t.Index)
+		case *ast.IndexListExpr:
+			walk(t.X)
+			for _, i := range t.Indices {
+				walk(i)
+			}
+		}
+	}
+	walk(e)
+	return out
 }
 
 // matchesFunc reports whether fd, in package pkg, is one of the functions

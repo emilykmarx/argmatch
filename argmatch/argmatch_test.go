@@ -291,6 +291,44 @@ func TestStackLog(t *testing.T) {
 	}
 }
 
+// TestChans builds testdata/chans with a stack log naming its functions and
+// -recvonly, and checks the chans output: every chosen function's channel
+// parameters, including Send's, which -recvonly leaves uninstrumented, with
+// the named types in their element types resolved through the file's
+// imports, and none for a predeclared type or a type parameter.
+func TestChans(t *testing.T) {
+	frames := ""
+	for _, fn := range []string{"main.R.Run", "main.Send", "main.Plain", "main.Gen[...]"} {
+		frames += fn + "(0x0)\\n\\t/src/main.go:1 +0x1\\n"
+	}
+	stacks := filepath.Join(t.TempDir(), "stacks.log")
+	line := `x msg="conn.log (send isConnected true): BEGIN STACKS\nCONN: {}\ngoroutine 1 [running]:\n` +
+		frames + `main.main()\n\t/src/main.go:1 +0x1\nCONTENTS: needle\nconn.log: END STACKS"` + "\n"
+	if err := os.WriteFile(stacks, []byte(line), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e := buildIn(t, "chans", "-stacklog", `"`+stacks+`"`, "-match", "needle", "-recvonly")
+	e.runRaw(t)
+	data, err := os.ReadFile(filepath.Join(e.tmp, "out.chans.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := readCSV(t, string(data))
+	slices.SortFunc(got[1:], func(a, b []string) int { return strings.Compare(strings.Join(a, ","), strings.Join(b, ",")) })
+	want := [][]string{
+		{"function", "parameter", "direction", "element", "named_types"},
+		{"main.Gen", "ch", "both", "T", ""}, // (argmatch names a generic function without [...])
+		{"main.Plain", "a", "both", "int", ""},
+		{"main.Plain", "d", "both", "time.Duration", "time.Duration"},
+		{"main.R.Run", "in", "recv", "map[string][]*tgp.Group", "example.com/chans/tg.Group"},
+		{"main.R.Run", "out", "send", "Local", "main.Local"},
+		{"main.Send", "ch", "both", "[]tgp.Group", "example.com/chans/tg.Group"},
+	}
+	if !slices.EqualFunc(got, want, slices.Equal) {
+		t.Errorf("chans output:\n%q\nwant:\n%q", got, want)
+	}
+}
+
 // TestExactDefault checks that by default a value must equal the match
 // string: "eedl" is in "needle" but isn't reported.
 func TestExactDefault(t *testing.T) {
@@ -368,11 +406,19 @@ func runExampleStderr(t *testing.T, flags ...string) (matches, stderr string) {
 type example struct {
 	tmp, wrapper, rtDir string
 	exe, out            string // the program and the file it writes matches to
+	dir                 string // the program's directory under testdata
 }
 
 // buildExample builds the wrapper and then testdata/example under it with
 // the given wrapper flags.
 func buildExample(t *testing.T, flags ...string) *example {
+	t.Helper()
+	return buildIn(t, "example", flags...)
+}
+
+// buildIn builds the wrapper and then testdata/<dir> under it with the
+// given wrapper flags.
+func buildIn(t *testing.T, dir string, flags ...string) *example {
 	t.Helper()
 	if runtime.GOOS != "linux" {
 		t.Skip("rt reads /proc/self")
@@ -386,7 +432,7 @@ func buildExample(t *testing.T, flags ...string) *example {
 	}
 	tmp := t.TempDir()
 	e := &example{tmp: tmp, wrapper: filepath.Join(tmp, "argmatch"), rtDir: rtDir,
-		exe: filepath.Join(tmp, "example"), out: filepath.Join(tmp, "out.txt")}
+		exe: filepath.Join(tmp, "example"), out: filepath.Join(tmp, "out.txt"), dir: dir}
 	run(t, rtDir, "go", "build", "-o", e.wrapper, ".")
 	e.build(t, flags...)
 	return e
@@ -406,7 +452,7 @@ func (e *example) goBuild(t *testing.T, goFlags []string, flags ...string) strin
 	toolexec := strings.Join(append([]string{`"` + e.wrapper + `"`,
 		"-out", `"` + e.out + `"`, "-rtdir", `"` + e.rtDir + `"`}, flags...), " ")
 	args := append(append([]string{"build", "-toolexec", toolexec}, goFlags...), "-o", e.exe, ".")
-	_, stderr := runStderr(t, filepath.Join(e.rtDir, "testdata", "example"), "go", args...)
+	_, stderr := runStderr(t, filepath.Join(e.rtDir, "testdata", e.dir), "go", args...)
 	return stderr
 }
 

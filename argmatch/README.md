@@ -97,6 +97,18 @@ done
 
 The variables captured by func values (closures and method values) aren't checked, so `G` in the example reports nothing. `-ignoreclosures=false` is refused: argmatch reads values using type information from `reflect`, which doesn't describe captured variables. (The delve version, tagged `delve-walker`, could check them; see [IMPLEMENTATIONS.md](IMPLEMENTATIONS.md).)
 
+A third CSV, the chans output, lists the channel parameters of every function `-func` or `-stacklog` chooses, whether or not it's instrumented (with `-recvonly`, a function without a receiver isn't): `matches.chans.csv` next to `-out matches.csv`. It's written when the outputs are opened (the program's first call of an instrumented function), and not at all without `-out`. It's for associating functions that pass data through channels of the same type, e.g. a producer that sends on a `chan<- []*targetgroup.Group` and a consumer that receives from a `<-chan map[string][]*targetgroup.Group`. Its columns:
+
+| Column | Contents |
+|---|---|
+| `function` | the function, named as in the other outputs |
+| `parameter` | the parameter's name (`_` if it has none) |
+| `direction` | `send` (`chan<- T`), `recv` (`<-chan T`) or `both` (`chan T`) |
+| `element` | the element type as written in the source, e.g. `map[string][]*targetgroup.Group` |
+| `named_types` | the named types in the element type, through pointers, slices, arrays, maps, channels and generic instantiations, each as `<import path>.<Name>` and separated by `;` (`github.com/prometheus/prometheus/discovery/targetgroup.Group`). Predeclared types (`struct{}` isn't named; `error` is predeclared) and the function's type parameters are left out, so a `chan struct{}` has none. |
+
+It's found from the syntax at compile time (`chanParams` in [main.go](main.go)), so a parameter whose type is a named channel type (`type C chan T`) isn't listed, and a package imported under a name the file doesn't give is guessed from its path (`fileImports`).
+
 ### Call IDs
 <!-- Reviewed by Emily -->
 Within a process, a call ID uniquely identifies one call of an instrumented function that finds at least one match. All matches found during that call share the call ID. Each call ID thus corresponds to a single tuple of (function, ancestry, stack), but multiple call IDs may share a tuple (e.g. from a function called twice in a row).

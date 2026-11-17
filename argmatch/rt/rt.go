@@ -67,6 +67,7 @@ var (
 
 	registerMu sync.Mutex
 	registered []string // the instrumented functions (see Register)
+	chans      []string // the chosen functions' channel parameters (see RegisterChans)
 )
 
 // Register records fns as instrumented functions. The wrapper makes each
@@ -79,6 +80,20 @@ var (
 func Register(fns []string) {
 	registerMu.Lock()
 	registered = append(registered, fns...)
+	registerMu.Unlock()
+}
+
+// RegisterChans records the channel parameters of chosen functions (those
+// -func or -stacklog names, instrumented or not), each as tab-separated
+// fields: function, parameter, direction, element type, and the named types
+// in the element type (see chanParams in the wrapper). Like Register, the
+// wrapper makes each file call it from an init function. They're written to
+// the chans output (see chansPath) when the outputs are opened.
+//
+//go:linkname RegisterChans
+func RegisterChans(params []string) {
+	registerMu.Lock()
+	chans = append(chans, params...)
 	registerMu.Unlock()
 }
 
@@ -164,6 +179,9 @@ func Check(calls *uint32, guard bool, fn string, names []string, args []any) {
 		writeCSV(out, [][]string{header(s)})
 		writeCSV(callsOut, [][]string{callsHeader})
 		outMu.Unlock()
+		if s.Out != "" {
+			writeChans(chansPath(s.Out))
+		}
 	})
 	memOnce.Do(memInit)
 	if memErr != nil {
@@ -345,6 +363,34 @@ func header(s *settings.Settings) []string {
 // found matches, written before them, giving its call ID and the goroutine
 // that made it (see splitStack).
 var callsHeader = []string{"call", "function", "ancestry", "stack"}
+
+// chansHeader is the header of the chans output (see RegisterChans).
+var chansHeader = []string{"function", "parameter", "direction", "element", "named_types"}
+
+// writeChans writes the registered channel parameters to path, as CSV,
+// overwriting it. Without an output file (Out), they aren't written.
+func writeChans(path string) {
+	fd, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "argmatch: %v; no chans output\n", err)
+		return
+	}
+	defer fd.Close()
+	registerMu.Lock()
+	rows := [][]string{chansHeader}
+	for _, c := range chans {
+		rows = append(rows, strings.Split(c, "\t"))
+	}
+	registerMu.Unlock()
+	writeCSV(fd, rows)
+}
+
+// chansPath returns the file the chans output goes to when the matches go
+// to out: out with ".chans" before its extension (matches.chans.csv).
+func chansPath(out string) string {
+	ext := filepath.Ext(out)
+	return strings.TrimSuffix(out, ext) + ".chans" + ext
+}
 
 // callsPath returns the file the calls output goes to when the matches go to
 // out: out with ".calls" before its extension (matches.calls.csv for

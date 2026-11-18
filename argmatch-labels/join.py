@@ -148,9 +148,19 @@ def main():
         return tuple(t[:3] for t in frames)
 
     index = collections.defaultdict(list)
+    unplaced = []
     for c in calls:
         f = c["chain"][0]
-        assert f[0] == "frame" and f[3][-1] == c["function"], (c["call"], f)
+        # A call whose stack doesn't start with its function's frame can't be joined: argmatch captures the stack at
+        # the call's first match, deep in its walker's recursion, and when the stack has over 100 frames Go's
+        # traceback elides the middle ones, so the function can fall among them (the stack then starts with
+        # "...N frames elided..."; Grafana's deep HTTP middleware stacks, 2026-11-17). Counted in the summary.
+        if f[0] == "elided":
+            unplaced.append(c)
+            continue
+        # (The function may be inlined into the physical frame, e.g. Grafana's APIBuilder.GetClient into
+        # GetPostStartHooks.func1 (2026-11-17): it's then one of the frame's inlined names, which events match too)
+        assert f[0] == "frame" and c["function"] in f[3], (c["call"], f)
         index[(f[1], c["function"], key(c["chain"][1:]))].append(c)
 
     joined = set()
@@ -180,6 +190,10 @@ def main():
         w.writerows(out)
 
     print(f"{len(calls)} calls with matches; {len(events)} events, {len(labels)} of them messages (as message_graph.py counts them)")
+    if unplaced:
+        fns = collections.Counter(c["function"].rsplit("/", 1)[-1] for c in unplaced)
+        print(f"calls not joined, their function's frame elided from the stack: {len(unplaced)} "
+              f"({', '.join(f'{fn} {n}' for fn, n in fns.most_common(5))})")
     print(f"joined (event, call) pairs: {len(joined)}; events joined: {len({e for e, _ in joined})}; calls joined: {len({c for _, c in joined})}")
     fns = collections.Counter((r[4].rsplit("/", 1)[-1], r[1]) for r in rows)
     print("joined pairs by function and message kind:")

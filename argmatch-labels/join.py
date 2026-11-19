@@ -95,6 +95,9 @@ NORMALIZE = [
     (re.compile(r"(--rw\.test\.)\d+"), r"\1<n>"),
     # Caddy's stapled OCSP responses, named for their certificate: caddy.ingress--ocsp.<name>-<cert hash>
     (re.compile(rf"(--ocsp\.[^,}}/ ]+?-)[0-9a-f]{{6,}}{_END}"), r"\1<hash>"),
+    # A folder UID Grafana generated (a folder provisioned without one, e.g. alert rules' groups.folder):
+    # util.GenerateShortUID, a letter a-f, a base-36 snowflake ID, a letter a-f (e.g. dg4pjmp70vw1sd; 2026-11-18)
+    (re.compile(rf"(?<=/folders/)[a-f][0-9a-z]{{11,13}}[a-f]{_END}"), "<uid>"),
 ]
 
 

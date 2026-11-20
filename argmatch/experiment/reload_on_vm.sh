@@ -12,9 +12,11 @@
 # the kubelet updates its copy of the file promptly, and the reload is only
 # sent once the pod's file has the new content.
 #
-# usage: reload_on_vm.sh LOGFILE
+# usage: reload_on_vm.sh LOGFILE [USER_AGENT]
+# USER_AGENT: the wget requests' User-Agent (e.g. paramtrack's testbed tags its workload's requests with one).
 set -euo pipefail
 log=$1
+agent=(${2:+-U "$2"})
 CTX=kind-prombench
 FILE=/etc/prometheus/config/prometheus.yaml
 k() { kubectl --context $CTX "$@"; }
@@ -61,9 +63,9 @@ set_config() {
         sleep 3
     done
     say "pod has the new config after $(( $(date +%s) - start ))s"
-    k exec deploy/prometheus-meta -c prometheus -- wget -qO- --post-data= \
+    k exec deploy/prometheus-meta -c prometheus -- wget -qO- "${agent[@]}" --post-data= \
         localhost:9090/prometheus-meta/-/reload > /dev/null
-    ok=$(k exec deploy/prometheus-meta -c prometheus -- wget -qO- localhost:9090/prometheus-meta/metrics |
+    ok=$(k exec deploy/prometheus-meta -c prometheus -- wget -qO- "${agent[@]}" localhost:9090/prometheus-meta/metrics |
         awk '/^prometheus_config_last_reload_successful / {print $2}')
     say "reloaded: prometheus_config_last_reload_successful=$ok"
     [ "$ok" = 1 ]

@@ -8,7 +8,10 @@ last hour as the time range, cycling until --duration seconds have passed.
 Prints the number of dashboards and of panel query requests (/api/ds/query)
 and their failures, so a viewer that isn't really querying is noticed.
 
-Usage: view_dashboards.py --url http://localhost:3000/grafana [--duration 150] [--dwell 15]
+With --user-agent, every request (the search API's, and the browser's: pages, scripts, panel queries) carries
+that User-Agent, so the servers' events can tell the viewer's requests apart.
+
+Usage: view_dashboards.py --url http://localhost:3000/grafana [--duration 150] [--dwell 15] [--user-agent UA]
 Needs: pip3 install --user playwright && python3 -m playwright install --with-deps chromium
 """
 
@@ -26,11 +29,13 @@ def main():
     p.add_argument("--url", required=True, help="Grafana's base URL, including its sub path")
     p.add_argument("--duration", type=float, default=150, help="seconds to keep viewing")
     p.add_argument("--dwell", type=float, default=15, help="seconds to stay on each dashboard")
+    p.add_argument("--user-agent", help="the User-Agent of every request (default: urllib's and Chromium's own)")
     args = p.parse_args()
     base = args.url.rstrip("/")
     end = time.time() + args.duration
 
-    with urllib.request.urlopen(f"{base}/api/search?type=dash-db") as r:
+    headers = {"User-Agent": args.user_agent} if args.user_agent else {}
+    with urllib.request.urlopen(urllib.request.Request(f"{base}/api/search?type=dash-db", headers=headers)) as r:
         dashboards = [d for d in json.load(r) if d.get("uid")]
     if not dashboards:
         sys.exit("view_dashboards.py: no dashboards found")
@@ -46,7 +51,8 @@ def main():
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
-        page = browser.new_page(viewport={"width": 1600, "height": 2000})
+        page = browser.new_page(viewport={"width": 1600, "height": 2000},
+                                **({"user_agent": args.user_agent} if args.user_agent else {}))
         page.on("response", on_response)
         i = 0
         while time.time() < end:

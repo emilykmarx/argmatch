@@ -17,7 +17,14 @@
 // Matches are printed to the program's stderr, or written to the file
 // given by -out, overwriting it.
 //
-// Only -func, -stacklog and -recvonly change the compiled code. The other
+// With -paramfuncs, the given functions are checked too, with their
+// parameters even under -recvonly. With -carriers, each call also reports the
+// carriers it's handed (values of the given types, each identified by a key:
+// see rt.Check), and every reported call is stamped with the server request
+// its goroutine is handling, if the program's net/http labels it (the
+// ConfTamer patch, conftamerLabelRequest).
+//
+// Only -func, -stacklog, -paramfuncs and -recvonly change the compiled code. The other
 // settings are run-time settings (see package argmatch/settings): they're
 // passed to the linker, so changing them only relinks the program, and the
 // program can override them with ARGMATCH_* environment variables when it
@@ -81,6 +88,9 @@ var (
 	maxMem         = byteSizeFlag("maxmem", envByteSize("ARGMATCH_MAXMEM", 0), "stop checking a call once the Go heap has grown by this much (e.g. 512MB, 2GiB, or bytes), and report the matches found so far; 0 means no limit (env ARGMATCH_MAXMEM)")
 	stats          = flag.Bool("stats", envBool("ARGMATCH_STATS", false), "print each check's time and read counts to stderr (env ARGMATCH_STATS)")
 	outPath        = flag.String("out", os.Getenv("ARGMATCH_OUT"), "file the program writes its matches to, overwriting it; resolved against the program's working directory (default: stderr; env ARGMATCH_OUT)")
+	paramFuncs     = flag.String("paramfuncs", os.Getenv("ARGMATCH_PARAMFUNCS"), "comma-separated functions to check as -func does, with their parameters even with -recvonly (env ARGMATCH_PARAMFUNCS)")
+	carriers       = flag.String("carriers", os.Getenv("ARGMATCH_CARRIERS"), "comma-separated carrier specs <type>:<field path>, e.g. github.com/prometheus/alertmanager/types.Alert:Labels: each call reports the values of <type> it's handed, by the key rt.Check renders from the field (env ARGMATCH_CARRIERS)")
+	carrierDepth   = flag.Int("carrierdepth", envInt("ARGMATCH_CARRIERDEPTH", 1), "report only carriers at most this many levels into a receiver or argument, counted as -depth counts (1: the argument, or an element of a slice argument) (env ARGMATCH_CARRIERDEPTH)")
 	rtDir          = flag.String("rtdir", os.Getenv("ARGMATCH_RTDIR"), "directory of the argmatch module (default: the directory containing this executable; env ARGMATCH_RTDIR)")
 )
 
@@ -105,15 +115,21 @@ func runTimeSettings() settings.Settings {
 		MaxMem:         int64(*maxMem),
 		Out:            *outPath,
 		Stats:          *stats,
+		Carriers:       settings.SplitList(*carriers),
+		CarrierDepth:   *carrierDepth,
 	}
 }
 
 // needles holds -match and the lines of -matchfile.
 var needles []string
 
-// funcs holds the functions to check, without any "[...]": -func, and the
-// functions in the stacks of -stacklog.
+// funcs holds the functions to check, without any "[...]": -func,
+// -paramfuncs, and the functions in the stacks of -stacklog.
 var funcs = map[string]bool{}
+
+// withParams holds -paramfuncs, without any "[...]": functions checked with
+// their parameters even with -recvonly.
+var withParams = map[string]bool{}
 
 // loadFuncs fills in funcs. Parsing a large log takes a while and the go
 // command runs the wrapper once per package, so the functions found in a
@@ -123,6 +139,10 @@ var funcs = map[string]bool{}
 func loadFuncs() {
 	if *funcName != "" {
 		funcs[strings.ReplaceAll(*funcName, "[...]", "")] = true
+	}
+	for _, fn := range settings.SplitList(*paramFuncs) {
+		fn = strings.ReplaceAll(fn, "[...]", "")
+		funcs[fn], withParams[fn] = true, true
 	}
 	if *stackLog == "" {
 		return
@@ -258,7 +278,7 @@ func main() {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
-	if *funcName == "" && *stackLog == "" || *needle == "" && *matchFile == "" || flag.NArg() == 0 {
+	if *funcName == "" && *stackLog == "" && *paramFuncs == "" || *needle == "" && *matchFile == "" || flag.NArg() == 0 {
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -324,7 +344,7 @@ func printToolID(tool string) {
 		check(err)
 		rtFiles = append(rtFiles, settingsFiles...)
 		h := sha256.New()
-		fmt.Fprintf(h, "%q %t ", slices.Sorted(maps.Keys(funcs)), *recvOnly)
+		fmt.Fprintf(h, "%q %q %t ", slices.Sorted(maps.Keys(funcs)), slices.Sorted(maps.Keys(withParams)), *recvOnly)
 		if isTool(tool, "link") {
 			fmt.Fprintf(h, "%s ", runTimeSettings().Encode())
 		}
@@ -394,7 +414,8 @@ func compileArgs(tool string, args []string, tmp string) []string {
 					chans = append(chans, strconv.Quote(name+"\t"+c))
 				}
 			}
-			if !ok || fd.Recv.NumFields() == 0 && (*recvOnly || fd.Type.Params.NumFields() == 0) {
+			recvOnlyFn := *recvOnly && !withParams[strings.ReplaceAll(name, "[...]", "")]
+			if !ok || fd.Recv.NumFields() == 0 && (recvOnlyFn || fd.Type.Params.NumFields() == 0) {
 				continue // nothing to check
 			}
 			if fd.Body == nil {
@@ -404,7 +425,7 @@ func compileArgs(tool string, args []string, tmp string) []string {
 				}
 				continue
 			}
-			edits = append(edits, instrument(fset, fd, name, instrumented, len(src), isStd)...)
+			edits = append(edits, instrument(fset, fd, name, instrumented, len(src), isStd, recvOnlyFn)...)
 			instrumented++
 			fns = append(fns, strconv.Quote(name))
 		}
@@ -616,7 +637,8 @@ func namedTypes(e ast.Expr, pkg string, imports map[string]string, typeParams ma
 // matchesFunc reports whether fd, in package pkg, is one of the functions
 // to check, and returns its name as delve names it. explicit reports
 // whether it was given by -func. Functions found only in -stacklog are
-// skipped if stacklog.IgnoreFn ignores them; isStd reports whether pkg is
+// skipped if stacklog.IgnoreFn ignores them (those of -paramfuncs are
+// explicit, like -func's); isStd reports whether pkg is
 // in the standard library.
 func matchesFunc(pkg string, isStd bool, fd *ast.FuncDecl) (name string, explicit, ok bool) {
 	name = funcDeclName(pkg, fd)
@@ -624,7 +646,7 @@ func matchesFunc(pkg string, isStd bool, fd *ast.FuncDecl) (name string, explici
 		return "", false, false
 	}
 	short := strings.ReplaceAll(name, "[...]", "")
-	if *funcName != "" && short == strings.ReplaceAll(*funcName, "[...]", "") {
+	if *funcName != "" && short == strings.ReplaceAll(*funcName, "[...]", "") || withParams[short] {
 		return name, true, true
 	}
 	if !funcs[short] || stacklog.IgnoreFn(name, func(string) bool { return isStd }) {
@@ -666,18 +688,18 @@ func funcDeclName(pkg string, fd *ast.FuncDecl) string {
 }
 
 // instrument returns the edits that make fd, named fn, call rt.Check with
-// the addresses of its receiver and parameters (only the receiver with
-// -recvonly), naming unnamed ones. fd gets a call counter for -maxcalls,
+// the addresses of its receiver and parameters (only the receiver if
+// recvOnly), naming unnamed ones. fd gets a call counter for -maxcalls,
 // declared at the end of its file (size bytes long) and named with id,
 // which is unique among the package's instrumented functions, and so do the
 // parameter names. guard (set for standard library functions, which rt
 // itself may call) is passed on to rt.Check.
-func instrument(fset *token.FileSet, fd *ast.FuncDecl, fn string, id, size int, guard bool) []edit {
+func instrument(fset *token.FileSet, fd *ast.FuncDecl, fn string, id, size int, guard, recvOnly bool) []edit {
 	off := func(p token.Pos) int { return fset.Position(p).Offset }
 	var edits []edit
 	var names, addrs []string
 	fields := fd.Type.Params.List
-	if *recvOnly {
+	if recvOnly {
 		fields = nil
 	}
 	if fd.Recv != nil {
@@ -762,7 +784,7 @@ func rtExports(tool string) []string {
 		return `"` + s + `"`
 	}
 	toolexec := strings.Join([]string{quote(self), "-func", quote(*funcName), "-stacklog", quote(*stackLog), "-match", quote(*needle),
-		"-matchfile", quote(*matchFile), "-depth", strconv.Itoa(*depth), "-maxelems", strconv.Itoa(*maxElems), "-maxfields", strconv.Itoa(*maxFields), "-maxtime", maxTime.String(), "-maxmem", maxMem.String(), "-maxcalls", strconv.Itoa(*maxCalls), "-callinterval", callInterval.String(), "-recvonly=" + strconv.FormatBool(*recvOnly), "-exact=" + strconv.FormatBool(*exact), "-ignoreclosures=" + strconv.FormatBool(*ignoreClosures),
+		"-matchfile", quote(*matchFile), "-depth", strconv.Itoa(*depth), "-maxelems", strconv.Itoa(*maxElems), "-maxfields", strconv.Itoa(*maxFields), "-maxtime", maxTime.String(), "-maxmem", maxMem.String(), "-maxcalls", strconv.Itoa(*maxCalls), "-callinterval", callInterval.String(), "-recvonly=" + strconv.FormatBool(*recvOnly), "-paramfuncs", quote(*paramFuncs), "-carriers", quote(*carriers), "-carrierdepth", strconv.Itoa(*carrierDepth), "-exact=" + strconv.FormatBool(*exact), "-ignoreclosures=" + strconv.FormatBool(*ignoreClosures),
 		"-ignorelibs=" + strconv.FormatBool(*ignoreLibs), "-ignoretypes", quote(*ignoreTypes),
 		"-stats=" + strconv.FormatBool(*stats), "-out", quote(*outPath), "-rtdir", quote(*rtDir)}, " ")
 	args := []string{"list", "-deps", "-export", "-toolexec", toolexec,

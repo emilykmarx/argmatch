@@ -47,6 +47,18 @@ Matches are exact by default: a value is reported only if it equals a match stri
 
 With `-recvonly` (env `ARGMATCH_RECVONLY=1`), only method receivers are checked, not parameters. Functions without a receiver are then skipped, including any named with `-func` or found in `-stacklog`.
 
+`-paramfuncs f1,f2,...` (env `ARGMATCH_PARAMFUNCS`) names more functions to check, as `-func` does, with their parameters checked even with `-recvonly`.
+
+### Carriers
+
+A carrier is a value that's handed from one function to another, e.g. Alertmanager's alerts, which a received request hands to the alert store, and which the dispatcher later hands to the notifiers that send them. `-carriers type:path,...` (env `ARGMATCH_CARRIERS`) makes each call report the carriers it's handed, so that calls handed the same carrier can be associated even when no stack or context connects them. Each spec names a type, as the outputs name types (`github.com/prometheus/alertmanager/types.Alert`; a main package's types are `main.T`), and a field path in it (`Labels`: field names separated by dots, found as `reflect`'s `FieldByName` finds them, so through embedded structs, with pointers followed). A carrier's key is the spec, `=`, and the value at the path rendered canonically: strings quoted, maps as `{k=v ...}` sorted by entry (so maps with the same entries render the same, whatever their memory order), slices as `[...]`, structs as `{F:v ...}` (`render` in [rt/carriers.go](rt/carriers.go)). So two alerts with the same labels have the same key:
+
+```
+github.com/prometheus/alertmanager/types.Alert:Labels={"alertname"="Foo" "severity"="page"}
+```
+
+Only carriers a call is handed count, not those reachable through what it's handed: `-carrierdepth` (env `ARGMATCH_CARRIERDEPTH`, default 1) bounds how many levels into a receiver or argument a carrier can be, counted as `-depth` counts. With 1, that's an argument itself or an element of a slice argument (`alerts ...*types.Alert`), but not the alerts a dispatcher's state holds. Carriers are found in a pass of their own, before the search for matches, so a search that runs out of `-maxtime` or `-maxmem` in a large receiver doesn't hide the carriers in the parameters after it. That pass is bounded by `-carrierdepth` and `-maxelems` alone; `-maxcalls` and `-callinterval` still choose which calls are checked, and `-recvonly` hides parameters unless the function is in `-paramfuncs`.
+
 ## Output
 Matches are written as CSV, one row per match, with these columns:
 
@@ -71,7 +83,7 @@ Each call of an instrumented function writes its own rows, so a function called 
 
 Rows have as many step columns as their path has steps, so rows differ in length. The header names only the first step column (`types`). The header is written once, at the top of the output. Errors always go to stderr as plain text, never into the CSV.
 
-Each call that finds matches is also described once, in a second CSV, the calls output, written before the call's matches: `matches.calls.csv` next to `-out matches.csv` (`.calls` goes before the extension), or to stderr without `-out`. Its columns:
+Each call that finds matches or carriers is also described once, in a second CSV, the calls output, written before the call's matches: `matches.calls.csv` next to `-out matches.csv` (`.calls` goes before the extension), or to stderr without `-out`. Its columns:
 
 | Column | Contents |
 |---|---|
@@ -79,6 +91,9 @@ Each call that finds matches is also described once, in a second CSV, the calls 
 | `function` | the instrumented function |
 | `ancestry` | the goroutine that made the call: its ID, where it was created, and (with `GODEBUG=tracebackancestors=N`) its ancestors' stacks when they created their children. Taken from `runtime.Stack`, and the same at every point in the goroutine, so it can join the output with other records made the same way, such as the ConfTamer HTTP events (`conftamer/contexttrack/go-inlibrary.patch`). `splitStack` in [rt/rt.go](rt/rt.go) defines both this and `stack`. |
 | `stack` | what that goroutine was running: `runtime.Stack`'s first line and frames, from the instrumented function outwards |
+| `request` | the server request the goroutine was handling, by the context ID the ConfTamer HTTP events log for it (`id:N`), from the goroutine labels the ConfTamer patch to net/http sets while a handler runs (`conftamer/contexttrack/README.md`); empty if none, or if the program's Go isn't patched. A goroutine the handler started inherits them. |
+| `request_goroutine` | the goroutine that started handling `request` (the call's own goroutine, unless the handler started it) |
+| `carriers` | the keys of the carriers the call was handed (see "Carriers" above), as a JSON list; empty if none |
 
 Output for `F` in `testdata/example/main.go`, without the `call` column:
 
@@ -118,7 +133,7 @@ Within a process, a call ID uniquely identifies one call of an instrumented func
 The program is never stopped or attached to. All instrumentation happens at compile time:
 
 - **Compile time ([main.go](main.go)):** in the package that contains the target function, a call is inserted at the top of the function. It passes the address of the receiver and each argument, boxed so the static type survives (an interface argument stays an interface). The edit adds no lines, so line numbers in panics and debug info stay correct. Packages are otherwise compiled as usual, with optimizations.
-- **Settings:** only `-func`, `-stacklog` and `-recvonly` change which code is instrumented. All the other settings only change what the helper does when the program runs: the match strings, `-exact`, `-ignoreclosures`, `-ignorelibs`, `-ignoretypes`, `-depth`, `-maxelems`, `-maxfields`, `-maxcalls`, `-maxtime`, `-maxmem` and `-out`. So they aren't compiled into the instrumented packages. The wrapper gives them to the linker instead (`-X argmatch/rt.encoded=…`, in a response file), and the go command's cache key for compiling leaves them out. Changing them relinks the program and reuses every compiled package.
+- **Settings:** only `-func`, `-stacklog`, `-paramfuncs` and `-recvonly` change which code is instrumented. All the other settings only change what the helper does when the program runs: the match strings, `-exact`, `-ignoreclosures`, `-ignorelibs`, `-ignoretypes`, `-depth`, `-maxelems`, `-maxfields`, `-maxcalls`, `-maxtime`, `-maxmem`, `-carriers`, `-carrierdepth` and `-out`. So they aren't compiled into the instrumented packages. The wrapper gives them to the linker instead (`-X argmatch/rt.encoded=…`, in a response file), and the go command's cache key for compiling leaves them out. Changing them relinks the program and reuses every compiled package.
 - **Overriding at run time:** the program can override the run-time settings with environment variables when it starts, with no rebuild, e.g. `ARGMATCH_DEPTH=20 ./program`. They're the same `ARGMATCH_*` variables the wrapper reads, and only those set to a non-empty value count. Setting `ARGMATCH_MATCH` or `ARGMATCH_MATCHFILE` replaces the match strings, and `ARGMATCH_MATCHFILE` is then read when the program starts, so it must exist where the program runs. The program says on stderr which variables it used (`argmatch: settings from the environment: …`), and which it couldn't parse. The helper's `settings` package ([settings/settings.go](settings/settings.go)) defines the settings, and is shared by the wrapper and the helper.
 - **Run time ([rt/rt.go](rt/rt.go)):** a small helper package linked into the program walks each argument on the calling goroutine, without touching the program's data directly:
   - **Reading:** every value's bytes are read through `/proc/self/mem`, so a bad pointer or a value that's being written gives a read error or wrong bytes, not a crash. A struct takes one read, and its fields are decoded from the buffer at their offsets; pointers, string contents and slice contents take one more read each.
@@ -128,7 +143,7 @@ The program is never stopped or attached to. All instrumentation happens at comp
 
 ## Tested
 
-`go test .` builds the example under argmatch and checks the matches for `F` three ways: with `-match needle` against the output above, with a match file, and with `-stacklog testdata/stacks.log` and no `-func`. It also checks that exact matching and ignoring closures are the defaults, that `-ignoreclosures=false` is refused, `-recvonly`, `-maxelems`, `-maxfields`, `-maxcalls`, `-maxtime`, `-maxmem`, `-ignorelibs`, `-ignoretypes`, map decoding (small and table-backed maps, indirect keys and values, basic and struct keys, nested maps, a map in an interface; [testdata/maps](testdata/maps/main.go)), overriding settings with environment variables at run time, and that changing only run-time settings relinks without recompiling. `go test ./settings` checks the settings encoding and environment parsing. It takes a few seconds (longer with a cold build cache) and is skipped by `go test -short`.
+`go test .` builds the example under argmatch and checks the matches for `F` three ways: with `-match needle` against the output above, with a match file, and with `-stacklog testdata/stacks.log` and no `-func`. It also checks that exact matching and ignoring closures are the defaults, that `-ignoreclosures=false` is refused, `-recvonly`, `-maxelems`, `-maxfields`, `-maxcalls`, `-maxtime`, `-maxmem`, `-ignorelibs`, `-ignoretypes`, map decoding (small and table-backed maps, indirect keys and values, basic and struct keys, nested maps, a map in an interface; [testdata/maps](testdata/maps/main.go)), overriding settings with environment variables at run time, that changing only run-time settings relinks without recompiling, and carriers ([testdata/carriers](testdata/carriers/main.go): `-paramfuncs` under `-recvonly`, keys through an embedded field and independent of map order, `-carrierdepth`, and the request stamp from goroutine labels). `go test ./settings` checks the settings encoding and environment parsing. It takes a few seconds (longer with a cold build cache) and is skipped by `go test -short`.
 
 Also tested by hand:
 

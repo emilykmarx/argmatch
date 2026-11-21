@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/csv"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -235,7 +236,7 @@ func TestAncestry(t *testing.T) {
 		t.Fatal(err)
 	}
 	calls := readCSV(t, string(data))
-	if want := []string{"call", "function", "ancestry", "stack"}; len(calls) != 2 || !slices.Equal(calls[0], want) {
+	if want := []string{"call", "function", "ancestry", "stack", "request", "request_goroutine", "carriers"}; len(calls) != 2 || !slices.Equal(calls[0], want) {
 		t.Fatalf("calls output:\n%s\nwant header %q and one call", data, want)
 	}
 	if calls[1][0] != rows[1][3] || calls[1][1] != "main.InGoroutine" {
@@ -251,6 +252,64 @@ func TestAncestry(t *testing.T) {
 	if !strings.HasPrefix(stack, id+" [running]:\nmain.InGoroutine(") || strings.Contains(stack, "argmatch/rt.") ||
 		strings.Contains(stack, "created by") {
 		t.Errorf("stack:\n%s\nwant %s's running frames, starting at main.InGoroutine", stack, id)
+	}
+}
+
+// TestCarriers builds testdata/carriers with -recvonly, -paramfuncs naming
+// Put and Notify, and a carrier spec for Alert by its (embedded) Labels, and
+// checks the calls output: a call row for each, though neither has a match;
+// Put's two alerts and Notify's one by their keys, equal for equal labels
+// whatever the maps' memory order; not the alert Store holds deeper than
+// -carrierdepth; and Put's request stamp from its goroutine's labels.
+func TestCarriers(t *testing.T) {
+	e := buildIn(t, "carriers", "-paramfuncs", "main.Put,main.(*Store).Notify", "-recvonly", "-match", "nomatch",
+		"-carriers", "main.Alert:Labels")
+	e.runRaw(t)
+	data, err := os.ReadFile(filepath.Join(e.tmp, "out.calls.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := readCSV(t, string(data))
+	const spec = "main.Alert:Labels="
+	a := spec + `{"alertname"="A" "severity"="page" "z"="1"}`
+	c := spec + `{"alertname"="C"}`
+	got := map[string][]string{}
+	for _, r := range rows[1:] {
+		got[r[1]] = []string{r[4], r[5], r[6]}
+	}
+	want := map[string][]string{
+		"main.Put":             {"id:7", "1", `["` + strings.ReplaceAll(a, `"`, `\"`) + `","` + strings.ReplaceAll(c, `"`, `\"`) + `"]`},
+		"main.(*Store).Notify": {"", "", `["` + strings.ReplaceAll(a, `"`, `\"`) + `"]`},
+	}
+	if len(rows) != 3 || !maps.EqualFunc(got, want, slices.Equal) {
+		t.Errorf("calls output:\n%s\nwant rows (function: request, request_goroutine, carriers) %q", data, want)
+	}
+	// The search's budget doesn't hide carriers: with -maxtime 1ns, it finds
+	// nothing, but the carriers are reported
+	e.runRaw(t, "ARGMATCH_MAXTIME=1ns")
+	data1, err := os.ReadFile(filepath.Join(e.tmp, "out.calls.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.EqualFunc(readCSV(t, string(data1)), rows, func(a, b []string) bool {
+		return a[1] == b[1] && slices.Equal(a[4:], b[4:])
+	}) {
+		t.Errorf("-maxtime 1ns: calls output:\n%s\nwant the same carriers as without it", data1)
+	}
+	// With -carrierdepth 2, Notify also reports the alert its receiver holds
+	e.runRaw(t, "ARGMATCH_CARRIERDEPTH=2")
+	data2, err := os.ReadFile(filepath.Join(e.tmp, "out.calls.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var notify string
+	for _, r := range readCSV(t, string(data2))[1:] {
+		if r[1] == "main.(*Store).Notify" {
+			notify = r[6]
+		}
+	}
+	if !strings.Contains(notify, strings.ReplaceAll(c, `"`, `\"`)) || !strings.Contains(notify, strings.ReplaceAll(a, `"`, `\"`)) {
+		t.Errorf("-carrierdepth 2: Notify's carriers %s, want A's and C's", notify)
 	}
 }
 

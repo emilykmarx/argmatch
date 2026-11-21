@@ -35,6 +35,8 @@ type Settings struct {
 	MaxMem         int64
 	Out            string // "" for stderr
 	Stats          bool   // print each check's time and read counts to stderr
+	Carriers       []string
+	CarrierDepth   int
 }
 
 // Default returns the default settings, with no needles.
@@ -47,6 +49,7 @@ func Default() Settings {
 		MaxElems:       64,
 		MaxFields:      -1,
 		MaxCalls:       3,
+		CarrierDepth:   1,
 	}
 }
 
@@ -78,7 +81,7 @@ func Decode(enc string) (Settings, error) {
 // ARGMATCH_IGNORETYPES, ARGMATCH_DEPTH, ARGMATCH_MAXELEMS,
 // ARGMATCH_MAXFIELDS, ARGMATCH_MAXCALLS, ARGMATCH_CALLINTERVAL,
 // ARGMATCH_MAXTIME, ARGMATCH_MAXMEM,
-// ARGMATCH_OUT and ARGMATCH_STATS. It returns the names of the variables it used, and an
+// ARGMATCH_OUT, ARGMATCH_STATS, ARGMATCH_CARRIERS and ARGMATCH_CARRIERDEPTH. It returns the names of the variables it used, and an
 // error for the first one it couldn't use; the others are still applied.
 func (s *Settings) FromEnv() (used []string, err error) {
 	fail := func(name string, e error) {
@@ -157,6 +160,10 @@ func (s *Settings) FromEnv() (used []string, err error) {
 		s.Out = v
 	}
 	setBool("ARGMATCH_STATS", &s.Stats)
+	if v, ok := get("ARGMATCH_CARRIERS"); ok {
+		s.Carriers = SplitList(v)
+	}
+	setInt("ARGMATCH_CARRIERDEPTH", &s.CarrierDepth)
 	return used, err
 }
 

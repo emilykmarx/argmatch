@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -68,6 +69,11 @@ var (
 	registerMu sync.Mutex
 	registered []string // the instrumented functions (see Register)
 	chans      []string // the chosen functions' channel parameters (see RegisterChans)
+
+	// carrierSpecs is Carriers parsed (see parseCarriers): type name -> its
+	// specs. Set by loadSettings before the settings are published.
+	carrierSpecs map[string][]carrierSpec
+	carrierTypes sync.Map // reflect.Type -> []carrierSpec (nil if t isn't a carrier type)
 )
 
 // Register records fns as instrumented functions. The wrapper makes each
@@ -99,7 +105,10 @@ func RegisterChans(params []string) {
 
 // Check reports every string in args that equals one of the needles (or,
 // if Exact is false, contains one), along with the named types and
-// interfaces on the path down to it, as CSV rows (see header). The
+// interfaces on the path down to it, as CSV rows (see header). It also
+// reports, in the calls output, the carriers the call is handed (see
+// carrierSpec): each value of a Carriers type at most CarrierDepth levels
+// into args (counted as Depth is), by its key. The
 // settings (settings.Settings) are loaded by the first call; see
 // loadSettings. names[i] is the source name of the parameter whose address
 // is boxed in args[i]. Output goes to the file Out, which the first call
@@ -190,6 +199,22 @@ func Check(calls *uint32, guard bool, fn string, names []string, args []any) {
 	}
 
 	w := newWalker(s, fn)
+	if carrierSpecs != nil {
+		// First the carriers, so that the search for matches (which can
+		// run out of budget in a large receiver before it gets to the
+		// parameters) doesn't hide them. It goes only CarrierDepth levels
+		// deep, so it's cheap, and has no budget; the search then gets its
+		// whole budget.
+		w.carrierPass = true
+		for _, arg := range args {
+			if p := reflect.ValueOf(arg); p.Kind() == reflect.Pointer && !p.IsNil() {
+				t := p.Type().Elem()
+				w.walk(t, w.read(p.Pointer(), t.Size()), 0)
+			}
+		}
+		w.carrierPass = false
+		w.startBudget()
+	}
 	reported := false // whether running out of budget was reported
 	for i, arg := range args {
 		if w.exceeded != "" {
@@ -209,10 +234,16 @@ func Check(calls *uint32, guard bool, fn string, names []string, args []any) {
 		w.expr = append(w.expr[:0], names[i]...)
 		w.walk(t, w.read(p.Pointer(), t.Size()), 0)
 	}
-	if len(w.rows) > 0 {
+	if len(w.rows) > 0 || len(w.carriers) > 0 {
+		w.identify()
+		carried := ""
+		if len(w.carriers) > 0 {
+			b, _ := json.Marshal(w.carriers)
+			carried = string(b)
+		}
 		// One write per call, so that calls' rows aren't interleaved.
 		outMu.Lock()
-		writeCSV(callsOut, [][]string{{w.call, fn, w.ancestry, w.stack}})
+		writeCSV(callsOut, [][]string{{w.call, fn, w.ancestry, w.stack, w.request, w.requestGoroutine, carried}})
 		writeCSV(out, w.rows)
 		outMu.Unlock()
 	}
@@ -291,6 +322,11 @@ func loadSettings() *settings.Settings {
 		fmt.Fprintln(os.Stderr, "argmatch: ignoring ARGMATCH_IGNORECLOSURES=false: closures' captured variables can't be checked")
 		s.IgnoreClosures = true
 	}
+	var bad []string
+	carrierSpecs, bad = parseCarriers(s.Carriers)
+	for _, c := range bad {
+		fmt.Fprintf(os.Stderr, "argmatch: ignoring carrier %q: not <type>:<field path>\n", c)
+	}
 	return &s
 }
 
@@ -360,9 +396,12 @@ func header(s *settings.Settings) []string {
 }
 
 // callsHeader names the columns of the calls output: one row per call that
-// found matches, written before them, giving its call ID and the goroutine
-// that made it (see splitStack).
-var callsHeader = []string{"call", "function", "ancestry", "stack"}
+// found matches or carriers, written before its matches, giving its call ID,
+// the goroutine that made it (see splitStack), the server request that
+// goroutine was handling (see requestLabels; "" if none) and the goroutine
+// that started handling it, and the call's carriers' keys as a JSON list (""
+// if none; see Check).
+var callsHeader = []string{"call", "function", "ancestry", "stack", "request", "request_goroutine", "carriers"}
 
 // chansHeader is the header of the chans output (see RegisterChans).
 var chansHeader = []string{"function", "parameter", "direction", "element", "named_types"}
@@ -488,8 +527,12 @@ type walker struct {
 	rows [][]string
 
 	// The call's ID, unique in the process, and its goroutine (see
-	// splitStack), found when the first match is reported.
-	call, ancestry, stack string
+	// splitStack) and request (see requestLabels), found when the first
+	// match or carrier is reported.
+	call, ancestry, stack, request, requestGoroutine string
+
+	carriers    []string // the keys of the carriers found, in order (see Check)
+	carrierPass bool     // whether this walk only looks for carriers, CarrierDepth levels deep
 
 	// The budget (MaxTime, MaxMem). Once exceeded is set, every read fails.
 	started  time.Time
@@ -501,14 +544,20 @@ type walker struct {
 }
 
 func newWalker(s *settings.Settings, fn string) *walker {
-	w := &walker{Settings: s, fn: fn, started: time.Now()}
-	if s.MaxTime > 0 {
-		w.deadline = w.started.Add(s.MaxTime)
+	w := &walker{Settings: s, fn: fn}
+	w.startBudget()
+	return w
+}
+
+// startBudget starts the walk's budget (MaxTime, MaxMem) afresh.
+func (w *walker) startBudget() {
+	w.started, w.exceeded = time.Now(), ""
+	if w.MaxTime > 0 {
+		w.deadline = w.started.Add(w.MaxTime)
 	}
-	if s.MaxMem > 0 {
+	if w.MaxMem > 0 {
 		w.baseHeap = heapBytes()
 	}
-	return w
 }
 
 // A step is a named type on the path to a match, or an interface (typ) with
@@ -544,13 +593,15 @@ func (w *walker) read(addr uintptr, size uintptr) []byte {
 	if w.exceeded != "" {
 		return nil
 	}
-	if !w.deadline.IsZero() {
+	if w.carrierPass {
+		// (No budget: the carrier pass is bounded by CarrierDepth and MaxElems)
+	} else if !w.deadline.IsZero() {
 		if now := time.Now(); now.After(w.deadline) {
 			w.exceeded = fmt.Sprintf("stopped at -maxtime after %v", now.Sub(w.started).Round(time.Millisecond))
 			return nil
 		}
 	}
-	if w.MaxMem > 0 && w.reads%heapCheckReads == 0 {
+	if w.MaxMem > 0 && !w.carrierPass && w.reads%heapCheckReads == 0 {
 		// The heap's growth covers the whole program, and only changes a
 		// span at a time; the bytes this check has read are what it has
 		// allocated for values, so count whichever is larger.
@@ -670,7 +721,12 @@ func (w *walker) walkValue(t reflect.Type, b []byte, level int) {
 	if b == nil {
 		return
 	}
-	if s, ok := w.stringValue(t, b); ok {
+	if w.carrierPass {
+		if level > w.CarrierDepth {
+			return
+		}
+		w.findCarriers(t, b)
+	} else if s, ok := w.stringValue(t, b); ok {
 		if len(w.path) > 0 {
 			for _, needle := range w.Needles {
 				if w.matches(s, needle) {
@@ -757,10 +813,7 @@ func (w *walker) report(val, needle string) {
 	if !w.Exact {
 		r = append(r, escape(val))
 	}
-	if w.call == "" {
-		w.call = strconv.FormatUint(nextCall.Add(1), 10)
-		w.ancestry, w.stack = splitStack(goroutineStack(), isRT)
-	}
+	w.identify()
 	r = append(r, w.fn, string(w.expr), w.call)
 	for _, s := range w.path {
 		r = append(r, s.String())
@@ -842,6 +895,15 @@ func mapTypeOf(t reflect.Type) (*mapType, bool) {
 // doesn't have the expected layout (another Go version) is skipped and
 // counted in badMaps.
 func (w *walker) walkMap(t reflect.Type, addr uintptr, level int) {
+	w.eachSlot(t, addr, w.MaxElems, func(mt *mapType, slot []byte, i int) {
+		w.entry(t, mt, slot, i, level)
+	})
+}
+
+// eachSlot calls f with each of the first max full slots of the map of type
+// t whose header is at addr, in memory order, as walkMap describes, and the
+// slot's index among them.
+func (w *walker) eachSlot(t reflect.Type, addr uintptr, max int, f func(mt *mapType, slot []byte, i int)) {
 	mt, ok := mapTypeOf(t)
 	if !ok {
 		w.badMaps++
@@ -854,7 +916,7 @@ func (w *walker) walkMap(t reflect.Type, addr uintptr, level int) {
 	w.maps++
 	dirPtr, dirLen := word(hdr[16:]), int(word(hdr[24:]))
 	entries := 0
-	group := func(g uintptr) bool { // walks group g's full slots; false once MaxElems are done
+	group := func(g uintptr) bool { // f's group g's full slots; false once max are done
 		b := w.read(g, mt.groupSize)
 		if b == nil {
 			return w.exceeded == ""
@@ -863,14 +925,13 @@ func (w *walker) walkMap(t reflect.Type, addr uintptr, level int) {
 			if b[i]&ctrlEmpty != 0 {
 				continue
 			}
-			if entries >= w.MaxElems {
+			if entries >= max {
 				return false
 			}
-			slot := b[slotsOffset+i*mt.slotSize:][:mt.slotSize]
-			w.entry(t, mt, slot, entries, level)
+			f(mt, b[slotsOffset+i*mt.slotSize:][:mt.slotSize], entries)
 			entries++
 		}
-		return entries < w.MaxElems
+		return entries < max
 	}
 	if dirLen == 0 {
 		if dirPtr != 0 {
@@ -910,18 +971,27 @@ func (w *walker) walkMap(t reflect.Type, addr uintptr, level int) {
 	}
 }
 
-// entry walks the key and value in a map slot, the i'th entry walked.
-func (w *walker) entry(t reflect.Type, mt *mapType, slot []byte, i, level int) {
+// slotEntry returns the key and value in a map slot, or false if they can't
+// be read.
+func (w *walker) slotEntry(t reflect.Type, mt *mapType, slot []byte) (key, elem []byte, ok bool) {
 	kt, et := t.Key(), t.Elem()
-	key := slot[:min(kt.Size(), uintptr(len(slot)))]
+	key = slot[:min(kt.Size(), uintptr(len(slot)))]
 	if mt.flags&mapIndirectKey != 0 {
 		key = w.read(word(slot), kt.Size())
 	}
-	elem := slot[mt.elemOff:][:min(et.Size(), mt.slotSize-mt.elemOff)]
+	elem = slot[mt.elemOff:][:min(et.Size(), mt.slotSize-mt.elemOff)]
 	if mt.flags&mapIndirectElem != 0 {
 		elem = w.read(word(slot[mt.elemOff:]), et.Size())
 	}
-	if key == nil || uintptr(len(key)) != kt.Size() || elem == nil || uintptr(len(elem)) != et.Size() {
+	ok = key != nil && uintptr(len(key)) == kt.Size() && elem != nil && uintptr(len(elem)) == et.Size()
+	return key, elem, ok
+}
+
+// entry walks the key and value in a map slot, the i'th entry walked.
+func (w *walker) entry(t reflect.Type, mt *mapType, slot []byte, i, level int) {
+	kt, et := t.Key(), t.Elem()
+	key, elem, ok := w.slotEntry(t, mt, slot)
+	if !ok {
 		return
 	}
 	// Name the entry by its key if it's a basic value, otherwise by its
